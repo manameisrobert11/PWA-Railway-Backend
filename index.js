@@ -44,16 +44,29 @@ const upload = multer({ dest: UPLOAD_DIR }); // Set up file upload middleware
 // --- API Routes ---
 // Add new scan (POST)
 app.post('/api/scan', (req, res) => {
-  const { serial, stage, operator, loadId, wagon1, wagon2, wagon3, timestamp } = req.body;
+  const { serial, stage, operator, loadId, wagon1, wagon2, wagon3, timestamp, grade, railType, spec, lengthM } = req.body;
 
   if (!serial) return res.status(400).json({ error: 'Serial required' });
 
   try {
     const stmt = db.prepare(`
-      INSERT INTO scans (serial, stage, operator, loadId, wagon1, wagon2, wagon3, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO scans (serial, stage, operator, loadId, wagon1, wagon2, wagon3, grade, railType, spec, lengthM, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const result = stmt.run(serial, stage || 'received', operator || 'unknown', loadId || '', wagon1 || '', wagon2 || '', wagon3 || '', timestamp || new Date().toISOString());
+    const result = stmt.run(
+      serial,
+      stage || 'received',
+      operator || 'unknown',
+      loadId || '',
+      wagon1 || '',
+      wagon2 || '',
+      wagon3 || '',
+      grade || '',
+      railType || '',
+      spec || '',
+      lengthM || '',
+      timestamp || new Date().toISOString()
+    );
     res.json({ ok: true, id: result.lastInsertRowid });
   } catch (e) {
     console.error('DB insert error', e);
@@ -67,6 +80,36 @@ app.get('/api/staged', (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
   });
+});
+
+// --- Delete a specific staged scan by ID ---
+app.delete('/api/staged/:id', (req, res) => {
+  const scanId = req.params.id;
+
+  if (!scanId) {
+    return res.status(400).json({ error: 'Scan ID is required' });
+  }
+
+  try {
+    // Check if the scan exists
+    const scanExists = db.prepare('SELECT * FROM scans WHERE id = ?').get(scanId);
+    if (!scanExists) {
+      return res.status(404).json({ error: 'Scan not found' });
+    }
+
+    // Delete the scan
+    const stmt = db.prepare('DELETE FROM scans WHERE id = ?');
+    const result = stmt.run(scanId);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Scan not found' });
+    }
+
+    res.json({ ok: true, message: 'Scan removed successfully' });
+  } catch (e) {
+    console.error('Error removing scan', e);
+    res.status(500).json({ error: 'Failed to remove scan' });
+  }
 });
 
 // Clear all scans (POST)
