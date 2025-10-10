@@ -1,19 +1,20 @@
 {
   "name": "rail-backend",
   "version": "1.0.0",
+  "type": "commonjs",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
- "dependencies": {
-  "sqlite3": "^5.0.2", 
-  "express": "^4.19.2",
-  "cors": "^2.8.5",
-  "multer": "^1.4.5-lts.1",
-  "xlsx": "^0.18.5"
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "sqlite3": "^5.1.6",
+    "express": "^4.21.1",
+    "multer": "^2.0.0",
+    "sqlite3": "^5.1.7",
+    "xlsx": "^0.18.5"
+  }
 }
-}
-
-
-
