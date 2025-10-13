@@ -5,18 +5,20 @@ import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import XLSX from 'xlsx';
-import sqlite3 from 'sqlite3';
+import sqlite3pkg from 'sqlite3';
+
+const __dirname = process.cwd();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 4000;
-
-// --- Database setup ---
-const DB_PATH = path.join(process.cwd(), 'rail_scans.db');
+// --- SQLite setup ---
+const sqlite3 = sqlite3pkg.verbose();
+const DB_PATH = path.join(__dirname, 'rail_scans.db');
 const db = new sqlite3.Database(DB_PATH);
 
+// Create table if not exists
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
@@ -24,113 +26,143 @@ db.serialize(() => {
       serial TEXT,
       stage TEXT,
       operator TEXT,
-      wagon1 TEXT,
-      wagon2 TEXT,
-      wagon3 TEXT,
+      wagon1Id TEXT,
+      wagon2Id TEXT,
+      wagon3Id TEXT,
       grade TEXT,
       railType TEXT,
       spec TEXT,
       lengthM TEXT,
-      timestamp TEXT
+      timestamp TEXT,
+      raw TEXT
     )
   `);
 });
 
-// --- File uploads setup ---
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
+// --- File storage setup ---
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const upload = multer({ dest: UPLOAD_DIR });
 
 // --- API routes ---
-
 // Add new scan
 app.post('/api/scan', (req, res) => {
-  const { serial, stage, operator, wagon1, wagon2, wagon3, grade, railType, spec, lengthM, timestamp } = req.body;
-  const ts = timestamp || new Date().toISOString();
+  const {
+    serial,
+    stage,
+    operator,
+    wagon1Id,
+    wagon2Id,
+    wagon3Id,
+    grade,
+    railType,
+    spec,
+    lengthM,
+    timestamp,
+    raw
+  } = req.body;
+
+  if (!serial) return res.status(400).json({ error: 'Serial required' });
 
   const stmt = db.prepare(`
-    INSERT INTO scans
-    (serial, stage, operator, wagon1, wagon2, wagon3, grade, railType, spec, lengthM, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scans 
+    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, grade, railType, spec, lengthM, timestamp, raw)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  stmt.run(serial, stage || 'received', operator || 'unknown', wagon1 || '', wagon2 || '', wagon3 || '', grade || '', railType || '', spec || '', lengthM || '', ts, function(err){
-    if(err) return res.status(500).json({ error: err.message });
-    res.json({ ok: true, id: this.lastID });
-  });
+
+  stmt.run(
+    serial,
+    stage || 'received',
+    operator || 'unknown',
+    wagon1Id || '',
+    wagon2Id || '',
+    wagon3Id || '',
+    grade || '',
+    railType || '',
+    spec || '',
+    lengthM || '',
+    timestamp || new Date().toISOString(),
+    raw || '',
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ok: true, id: this.lastID });
+    }
+  );
+
+  stmt.finalize();
 });
 
-// Get all staged scans
+// Get staged scans
 app.get('/api/staged', (_req, res) => {
-  db.all(`SELECT * FROM scans ORDER BY id DESC`, (err, rows) => {
-    if(err) return res.status(500).json({ error: err.message });
+  db.all('SELECT * FROM scans ORDER BY id DESC', (_err, rows) => {
     res.json(rows);
   });
 });
 
-// Delete a scan
+// Delete scan
 app.delete('/api/staged/:id', (req, res) => {
   const { id } = req.params;
-  db.run(`DELETE FROM scans WHERE id = ?`, [id], function(err){
-    if(err) return res.status(500).json({ error: err.message });
-    res.json({ ok: true });
+  db.run('DELETE FROM scans WHERE id = ?', [id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ ok: true, id });
   });
 });
 
 // Clear all scans
 app.post('/api/staged/clear', (_req, res) => {
-  db.run(`DELETE FROM scans`, function(err){
-    if(err) return res.status(500).json({ error: err.message });
+  db.run('DELETE FROM scans', function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ ok: true });
   });
 });
 
-// Upload Excel template
+// Upload template (.xlsm)
 app.post('/api/upload-template', upload.single('template'), (req, res) => {
-  res.json({ ok: true, path: req.file?.path });
+  res.json({ ok: true, path: req.file.path });
 });
 
-// Export staged scans to Excel (.xlsm)
+// Export to Excel
 app.post('/api/export-to-excel', (_req, res) => {
-  const templatePath = path.join(UPLOAD_DIR, 'template.xlsm');
-  if(!fs.existsSync(templatePath)) return res.status(400).json({ error: 'template.xlsm not found in uploads/' });
+  try {
+    const templatePath = path.join(UPLOAD_DIR, 'template.xlsm');
+    if (!fs.existsSync(templatePath)) return res.status(400).json({ error: 'template.xlsm not found' });
 
-  const wb = XLSX.readFile(templatePath, { bookVBA: true, cellDates: true });
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const existing = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
+    const sheetName = wb.SheetNames[0];
+    const ws = wb.Sheets[sheetName];
+    const existing = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
-  db.all(`SELECT * FROM scans ORDER BY id ASC`, (err, rows) => {
-    if(err) return res.status(500).json({ error: err.message });
+    db.all('SELECT * FROM scans', (_err, scans) => {
+      const appended = existing.concat(
+        scans.map(s => ({
+          Serial: s.serial,
+          Stage: s.stage,
+          Operator: s.operator,
+          Wagon1: s.wagon1Id,
+          Wagon2: s.wagon2Id,
+          Wagon3: s.wagon3Id,
+          Grade: s.grade,
+          RailType: s.railType,
+          Spec: s.spec,
+          LengthM: s.lengthM,
+          Timestamp: s.timestamp
+        }))
+      );
 
-    const appended = existing.concat(rows.map(s => ({
-      Serial: s.serial,
-      Stage: s.stage,
-      Operator: s.operator,
-      Wagon1: s.wagon1,
-      Wagon2: s.wagon2,
-      Wagon3: s.wagon3,
-      Grade: s.grade,
-      RailType: s.railType,
-      Spec: s.spec,
-      Length: s.lengthM,
-      Timestamp: s.timestamp
-    })));
+      const newWs = XLSX.utils.json_to_sheet(appended, { skipHeader: false });
+      wb.Sheets[sheetName] = newWs;
 
-    const newWs = XLSX.utils.json_to_sheet(appended, { skipHeader: false });
-    wb.Sheets[sheetName] = newWs;
-
-    const outName = `Master_${Date.now()}.xlsm`;
-    const outPath = path.join(UPLOAD_DIR, outName);
-    XLSX.writeFile(wb, outPath, { bookType:'xlsm', bookVBA:true });
-
-    res.download(outPath, outName);
-  });
+      const outName = `Master_${Date.now()}.xlsm`;
+      const outPath = path.join(UPLOAD_DIR, outName);
+      XLSX.writeFile(wb, outPath, { bookType: 'xlsm', bookVBA: true });
+      res.download(outPath, outName);
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Health check
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, db: fs.existsSync(DB_PATH) });
-});
-
-// Start server
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+// --- Start server ---
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend running on :${PORT}`));
