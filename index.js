@@ -18,6 +18,7 @@ app.use(express.json());
 const DB_PATH = path.join(__dirname, "rail_scans.db");
 const db = new sqlite3pkg.Database(DB_PATH);
 
+// Create table (base schema)
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
@@ -28,6 +29,8 @@ db.serialize(() => {
       wagon1Id TEXT,
       wagon2Id TEXT,
       wagon3Id TEXT,
+      receivedAt TEXT,
+      loadedAt TEXT,
       grade TEXT,
       railType TEXT,
       spec TEXT,
@@ -36,6 +39,28 @@ db.serialize(() => {
     )
   `);
 });
+
+// Ensure new columns exist for older DBs (auto-migrate)
+function ensureColumns() {
+  db.all(`PRAGMA table_info(scans)`, (err, cols) => {
+    if (err) {
+      console.error("PRAGMA error:", err);
+      return;
+    }
+    const names = new Set(cols.map((c) => c.name));
+    const alters = [];
+    if (!names.has("receivedAt")) alters.push(`ALTER TABLE scans ADD COLUMN receivedAt TEXT;`);
+    if (!names.has("loadedAt")) alters.push(`ALTER TABLE scans ADD COLUMN loadedAt TEXT;`);
+
+    if (alters.length) {
+      db.serialize(() => {
+        alters.forEach((sql) => db.run(sql));
+      });
+      console.log("✅ Added missing columns:", alters.join(" "));
+    }
+  });
+}
+ensureColumns();
 
 // --- Upload directory ---
 const UPLOAD_DIR = path.join(__dirname, "uploads");
@@ -63,6 +88,8 @@ app.post("/api/scan", (req, res) => {
     wagon1Id,
     wagon2Id,
     wagon3Id,
+    receivedAt,
+    loadedAt,
     grade,
     railType,
     spec,
@@ -75,9 +102,9 @@ app.post("/api/scan", (req, res) => {
   const ts = timestamp || new Date().toISOString();
 
   const stmt = db.prepare(
-    `INSERT INTO scans 
-    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, grade, railType, spec, lengthM, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO scans
+    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt, grade, railType, spec, lengthM, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   stmt.run(
@@ -87,6 +114,8 @@ app.post("/api/scan", (req, res) => {
     wagon1Id || "",
     wagon2Id || "",
     wagon3Id || "",
+    receivedAt || "",
+    loadedAt || "",
     grade || "",
     railType || "",
     spec || "",
@@ -99,13 +128,15 @@ app.post("/api/scan", (req, res) => {
         serial,
         stage: stage || "received",
         operator: operator || "unknown",
-        wagon1Id,
-        wagon2Id,
-        wagon3Id,
-        grade,
-        railType,
-        spec,
-        lengthM,
+        wagon1Id: wagon1Id || "",
+        wagon2Id: wagon2Id || "",
+        wagon3Id: wagon3Id || "",
+        receivedAt: receivedAt || "",
+        loadedAt: loadedAt || "",
+        grade: grade || "",
+        railType: railType || "",
+        spec: spec || "",
+        lengthM: lengthM || "",
         timestamp: ts,
       };
       io.emit("new-scan", newScan);
@@ -176,6 +207,8 @@ app.post("/api/export-to-excel", (_req, res) => {
           Wagon1ID: s.wagon1Id,
           Wagon2ID: s.wagon2Id,
           Wagon3ID: s.wagon3Id,
+          RecievedAt: s.receivedAt, // keep label as requested
+          LoadedAt: s.loadedAt,
           Grade: s.grade,
           RailType: s.railType,
           Spec: s.spec,
