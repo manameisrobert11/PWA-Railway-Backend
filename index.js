@@ -1,292 +1,186 @@
-// src/App.jsx
-import React, { useEffect, useState, useRef, useMemo } from "react";
-import Scanner from "./scanner/Scanner.jsx";
-import StartPage from "./StartPage.jsx";
-import { io } from "socket.io-client";
-import "./app.css";
+// backend/index.js
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import path from "path";
+import multer from "multer";
+import XLSX from "xlsx";
+import { Server } from "socket.io";
+import http from "http";
+import sqlite3pkg from "sqlite3";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "";
-const api = (p) => (p.startsWith("/") ? `${API_BASE}${p}` : `${API_BASE}/${p}`);
+const __dirname = process.cwd();
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
 
-// --- QR Parsing Helper ---
-function parseQrPayload(raw) {
-  const clean = String(raw || "")
-    .replace(/[^\x20-\x7E]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+app.use(cors());
+app.use(express.json());
 
-  const tokens = clean.split(/[ ,;|:/\t\r\n]+/).filter(Boolean);
+// --- SQLite setup ---
+const sqlite3 = sqlite3pkg.verbose();
+const DB_PATH = path.join(__dirname, "rail_scans.db");
+const db = new sqlite3.Database(DB_PATH);
 
-  let grade = "";
-  let railType = "";
-  let serial = "";
-  let spec = "";
-  let lengthM = "";
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      serial TEXT,
+      stage TEXT,
+      operator TEXT,
+      wagon1Id TEXT,
+      wagon2Id TEXT,
+      wagon3Id TEXT,
+      grade TEXT,
+      railType TEXT,
+      spec TEXT,
+      lengthM TEXT,
+      raw TEXT,
+      timestamp TEXT
+    )
+  `);
+});
 
-  try {
-    const lenTok = tokens.find((t) => /^[0-9]{1,3}m$/i.test(t));
-    if (lenTok) lengthM = lenTok.replace(/m/i, "");
+// --- Uploads directory ---
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const upload = multer({ dest: UPLOAD_DIR });
 
-    const gTok = tokens.find((t) => /^SAR\d{2}$/i.test(t));
-    if (gTok) grade = gTok.toUpperCase();
+// --- API Routes ---
 
-    const tTok = tokens.find((t) => /^R\d{3}[A-Z]*$/i.test(t));
-    if (tTok) railType = tTok.toUpperCase();
+// Add new scan
+app.post("/api/scan", (req, res) => {
+  const { serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, grade, railType, spec, lengthM, raw, timestamp } = req.body;
 
-    const sTok = tokens.find((t) => /^[A-Z0-9-]{8,22}$/i.test(t) && /[A-Z]/i.test(t) && /\d/.test(t));
-    if (sTok) serial = sTok.toUpperCase();
+  if (!serial) return res.status(400).json({ error: "Serial required" });
 
-    for (let i = 0; i < tokens.length - 1; i++) {
-      const pair = `${tokens[i]} ${tokens[i + 1]}`.trim();
-      if (/^[A-Z]{2,4}\s+[0-9A-Z/.\-]{3,}$/.test(pair)) {
-        spec = pair.toUpperCase();
-        break;
-      }
+  const ts = timestamp || new Date().toISOString();
+  const stmt = db.prepare(`
+    INSERT INTO scans
+    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, grade, railType, spec, lengthM, raw, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    serial,
+    stage || "received",
+    operator || "unknown",
+    wagon1Id || "",
+    wagon2Id || "",
+    wagon3Id || "",
+    grade || "",
+    railType || "",
+    spec || "",
+    lengthM || "",
+    raw || "",
+    ts,
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      const inserted = {
+        id: this.lastID,
+        serial,
+        stage,
+        operator,
+        wagon1Id,
+        wagon2Id,
+        wagon3Id,
+        grade,
+        railType,
+        spec,
+        lengthM,
+        raw,
+        timestamp: ts,
+      };
+      io.emit("new-scan", inserted); // Real-time broadcast
+      res.json({ ok: true, id: this.lastID });
     }
-  } catch (err) {
-    console.warn("QR parsing failed:", err);
-  }
-
-  return { grade, railType, serial, spec, lengthM, raw: clean };
-}
-
-// --- React App ---
-export default function App() {
-  const [view, setView] = useState("home");
-  const [status, setStatus] = useState("Ready");
-  const [scans, setScans] = useState([]);
-  const [operator, setOperator] = useState("Clerk A");
-  const [wagon1Id, setWagon1Id] = useState("");
-  const [wagon2Id, setWagon2Id] = useState("");
-  const [wagon3Id, setWagon3Id] = useState("");
-  const [pending, setPending] = useState(null);
-  const [qrExtras, setQrExtras] = useState({ grade: "", railType: "", spec: "", lengthM: "" });
-  const [removePrompt, setRemovePrompt] = useState(null);
-
-  const beepRef = useRef(null);
-  const socketRef = useRef(null);
-
-  const ensureBeep = () => {
-    if (!beepRef.current) {
-      const dataUri =
-        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYBAGZkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZAA=";
-      beepRef.current = new Audio(dataUri);
-    }
-    try {
-      beepRef.current.currentTime = 0;
-      beepRef.current.play();
-    } catch {}
-  };
-
-  // --- Socket.IO setup ---
-  useEffect(() => {
-    const fetchInitial = async () => {
-      try {
-        const r = await fetch(api("/staged"));
-        if (r.ok) setScans(await r.json());
-      } catch (e) {
-        console.warn("Backend unreachable:", e.message);
-      }
-    };
-    fetchInitial();
-
-    const socket = io(API_BASE || "http://localhost:4000");
-    socketRef.current = socket;
-
-    socket.on("new-scan", (scan) => setScans((prev) => [scan, ...prev]));
-    socket.on("deleted-scan", ({ id }) => setScans((prev) => prev.filter((s) => s.id !== id)));
-    socket.on("cleared-scans", () => setScans([]));
-
-    return () => socket.disconnect();
-  }, []);
-
-  // --- Duplicate helper ---
-  const scanSerialSet = useMemo(() => new Set(scans.map((s) => s.serial?.toUpperCase())), [scans]);
-  const findDuplicates = (serial) => scans.filter((s) => s.serial?.toUpperCase() === serial.toUpperCase());
-
-  // --- Scanner detected ---
-  const onDetected = (rawText) => {
-    const parsed = parseQrPayload(rawText);
-    if (!parsed.serial) return;
-
-    ensureBeep();
-    setPending({
-      serial: parsed.serial,
-      raw: parsed.raw,
-      capturedAt: new Date().toISOString(),
-    });
-    setQrExtras({
-      grade: parsed.grade,
-      railType: parsed.railType,
-      spec: parsed.spec,
-      lengthM: parsed.lengthM,
-    });
-    setStatus("Captured — review & Confirm");
-  };
-
-  // --- Save pending scan ---
-  const confirmPending = async () => {
-    if (!pending?.serial) return alert("Nothing to save.");
-
-    const rec = {
-      serial: pending.serial,
-      stage: "received",
-      operator,
-      wagon1Id,
-      wagon2Id,
-      wagon3Id,
-      grade: qrExtras.grade,
-      railType: qrExtras.railType,
-      spec: qrExtras.spec,
-      lengthM: qrExtras.lengthM,
-      raw: pending.raw,
-      timestamp: new Date().toISOString(),
-    };
-
-    setStatus("Saving…");
-    try {
-      const resp = await fetch(api("/scan"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rec),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data?.error || "Save failed");
-
-      setScans((prev) => [{ ...rec, id: data.id }, ...prev]);
-      setPending(null);
-      setWagon1Id("");
-      setWagon2Id("");
-      setWagon3Id("");
-      setStatus("Ready");
-    } catch (e) {
-      alert(e.message || "Failed to save");
-      setStatus("Ready");
-    }
-  };
-
-  const discardPending = () => {
-    setPending(null);
-    setQrExtras({ grade: "", railType: "", spec: "", lengthM: "" });
-    setStatus("Ready");
-  };
-
-  // --- Delete scan ---
-  const handleRemoveScan = (id) => setRemovePrompt(id);
-  const confirmRemoveScan = async () => {
-    if (!removePrompt) return;
-    try {
-      const resp = await fetch(api(`/remove-scan/${removePrompt}`), { method: "DELETE" });
-      if (!resp.ok) throw new Error("Failed to remove scan");
-      setScans((prev) => prev.filter((s) => s.id !== removePrompt));
-      setRemovePrompt(null);
-      setStatus("Scan removed");
-    } catch (e) {
-      alert(e.message);
-      setRemovePrompt(null);
-    }
-  };
-  const discardRemovePrompt = () => setRemovePrompt(null);
-
-  // --- Export ---
-  const exportToExcel = async () => {
-    setStatus("Exporting…");
-    try {
-      const resp = await fetch(api("/export-to-excel"), { method: "POST" });
-      if (!resp.ok) throw new Error(await resp.text() || "Export failed");
-      const blob = await resp.blob();
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `Master_${Date.now()}.xlsm`;
-      a.click();
-    } catch (e) {
-      alert(e.message);
-    } finally {
-      setStatus("Ready");
-    }
-  };
-
-  return (
-    <div className="container" style={{ paddingTop: 20, paddingBottom: 20 }}>
-      {/* Remove confirmation */}
-      {removePrompt && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "grid", placeItems: "center" }}>
-          <div className="card" style={{ padding: 16 }}>
-            <h3>Confirm Delete</h3>
-            <p>Are you sure you want to delete this scan?</p>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button className="btn btn-outline" onClick={discardRemovePrompt}>Cancel</button>
-              <button className="btn" onClick={confirmRemoveScan}>Confirm</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <header className="app-header">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
-            <button className="btn btn-outline" onClick={() => setView("home")}>Home</button>
-            <span className="brand" style={{ cursor: "pointer" }} onClick={() => setView("home")}>Rail Inventory</span>
-          </div>
-          <div className="status">Status: {status}</div>
-        </div>
-      </header>
-
-      {view === "home" ? (
-        <StartPage onStartScan={() => setView("scan")} onExport={exportToExcel} operator={operator} setOperator={setOperator} />
-      ) : (
-        <div className="grid" style={{ marginTop: 20 }}>
-          <section className="card">
-            <h3>Scanner</h3>
-            <Scanner onDetected={onDetected} />
-            {pending && <div className="notice">Pending: {pending.serial}</div>}
-          </section>
-
-          <section className="card">
-            <h3>Controls</h3>
-            <div style={{ display: "grid", gap: 12 }}>
-              <label>Operator</label>
-              <input className="input" value={operator} onChange={e => setOperator(e.target.value)} />
-
-              <label>Wagon 1 ID</label>
-              <input className="input" value={wagon1Id} onChange={e => setWagon1Id(e.target.value)} />
-              <label>Wagon 2 ID</label>
-              <input className="input" value={wagon2Id} onChange={e => setWagon2Id(e.target.value)} />
-              <label>Wagon 3 ID</label>
-              <input className="input" value={wagon3Id} onChange={e => setWagon3Id(e.target.value)} />
-
-              <label>Grade</label>
-              <input className="input" value={qrExtras.grade} readOnly />
-              <label>Rail Type</label>
-              <input className="input" value={qrExtras.railType} readOnly />
-              <label>Spec</label>
-              <input className="input" value={qrExtras.spec} readOnly />
-              <label>Length (m)</label>
-              <input className="input" value={qrExtras.lengthM} readOnly />
-
-              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                <button className="btn btn-outline" onClick={discardPending} disabled={!pending}>Discard Pending</button>
-                <button className="btn" onClick={confirmPending} disabled={!pending}>Confirm & Save</button>
-                <button className="btn" onClick={exportToExcel}>Export Excel (.xlsm)</button>
-              </div>
-            </div>
-          </section>
-
-          <section className="card" style={{ gridColumn: "1 / -1" }}>
-            <h3>Staged Scans</h3>
-            {scans.length === 0 && <div style={{ color: "var(--muted)" }}>No scans yet</div>}
-            {scans.map(s => (
-              <div key={s.id} className="item">
-                <div><strong>{s.serial}</strong> ({s.operator})</div>
-                <div>W1: {s.wagon1Id || "-"} | W2: {s.wagon2Id || "-"} | W3: {s.wagon3Id || "-"}</div>
-                <div>{s.grade} • {s.railType} • {s.spec} • {s.lengthM}m</div>
-                <div>{s.stage} • {new Date(s.timestamp).toLocaleString()}</div>
-                <button className="btn btn-outline" onClick={() => handleRemoveScan(s.id)}>Delete</button>
-              </div>
-            ))}
-          </section>
-        </div>
-      )}
-    </div>
   );
-}
+  stmt.finalize();
+});
+
+// Get all staged scans
+app.get("/api/staged", (_req, res) => {
+  db.all("SELECT * FROM scans ORDER BY id DESC", (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+// Delete a scan by ID
+app.delete("/api/remove-scan/:id", (req, res) => {
+  const { id } = req.params;
+  db.run("DELETE FROM scans WHERE id = ?", [id], function (err) {
+    if (err) return res.status(500).json({ error: err.message });
+    io.emit("deleted-scan", { id: Number(id) }); // Real-time broadcast
+    res.json({ ok: true });
+  });
+});
+
+// Clear all scans
+app.post("/api/staged/clear", (_req, res) => {
+  db.run("DELETE FROM scans", function (err) {
+    if (err) return res.status(500).json({ error: err.message });
+    io.emit("cleared-scans"); // Real-time broadcast
+    res.json({ ok: true });
+  });
+});
+
+// Upload Excel template
+app.post("/api/upload-template", upload.single("template"), (req, res) => {
+  res.json({ ok: true, path: req.file?.path });
+});
+
+// Export to Excel (.xlsm)
+app.post("/api/export-to-excel", (_req, res) => {
+  try {
+    const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
+    if (!fs.existsSync(templatePath)) return res.status(400).json({ error: "template.xlsm not found" });
+
+    const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
+    const sheetName = wb.SheetNames[0];
+    const ws = wb.Sheets[sheetName];
+    const existing = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+    db.all("SELECT * FROM scans ORDER BY id ASC", (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      const appended = existing.concat(
+        rows.map(s => ({
+          Serial: s.serial,
+          Stage: s.stage,
+          Operator: s.operator,
+          Wagon1: s.wagon1Id,
+          Wagon2: s.wagon2Id,
+          Wagon3: s.wagon3Id,
+          Grade: s.grade,
+          RailType: s.railType,
+          Spec: s.spec,
+          LengthM: s.lengthM,
+          Timestamp: s.timestamp,
+        }))
+      );
+
+      const newWs = XLSX.utils.json_to_sheet(appended, { skipHeader: false });
+      wb.Sheets[sheetName] = newWs;
+
+      const outName = `Master_${Date.now()}.xlsm`;
+      const outPath = path.join(UPLOAD_DIR, outName);
+      XLSX.writeFile(wb, outPath, { bookType: "xlsm", bookVBA: true });
+
+      res.download(outPath, outName);
+    });
+  } catch (err) {
+    console.error("Export failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Health check
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, db: fs.existsSync(DB_PATH) });
+});
+
+// --- Start server ---
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`));
