@@ -292,6 +292,99 @@ app.post("/api/export-to-excel", (_req, res) => {
   }
 });
 
+// Export to .xlsx with embedded QR images (no macros)
+app.post("/api/export-xlsx-images", (_req, res) => {
+  db.all("SELECT * FROM scans ORDER BY id ASC", async (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    try {
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("Scans");
+
+      // Fixed column layout
+      const columns = [
+        { header: "Serial",      key: "serial",      width: 22 },
+        { header: "Stage",       key: "stage",       width: 12 },
+        { header: "Operator",    key: "operator",    width: 18 },
+        { header: "Wagon1ID",    key: "wagon1Id",    width: 14 },
+        { header: "Wagon2ID",    key: "wagon2Id",    width: 14 },
+        { header: "Wagon3ID",    key: "wagon3Id",    width: 14 },
+        { header: "RecievedAt",  key: "receivedAt",  width: 18 }, // (label kept as you typed)
+        { header: "LoadedAt",    key: "loadedAt",    width: 18 },
+        { header: "Grade",       key: "grade",       width: 12 },
+        { header: "RailType",    key: "railType",    width: 12 },
+        { header: "Spec",        key: "spec",        width: 18 },
+        { header: "Length",      key: "lengthM",     width: 10 },
+        { header: "QRText",      key: "qrRaw",       width: 42 },
+        { header: "QR Image",    key: "qrImage",     width: 16 },  // image column
+        { header: "Timestamp",   key: "timestamp",   width: 24 },
+      ];
+      ws.columns = columns;
+
+      // Push the rows (text fields only; we insert images after)
+      rows.forEach((s) => {
+        ws.addRow({
+          serial:     s.serial || "",
+          stage:      s.stage || "",
+          operator:   s.operator || "",
+          wagon1Id:   s.wagon1Id || "",
+          wagon2Id:   s.wagon2Id || "",
+          wagon3Id:   s.wagon3Id || "",
+          receivedAt: s.receivedAt || "",
+          loadedAt:   s.loadedAt || "",
+          grade:      s.grade || "",
+          railType:   s.railType || "",
+          spec:       s.spec || "",
+          lengthM:    s.lengthM || "",
+          qrRaw:      s.qrRaw || s.serial || "",
+          qrImage:    "", // placeholder cell for the image
+          timestamp:  s.timestamp || "",
+        });
+      });
+
+      // Make header bold
+      ws.getRow(1).font = { bold: true };
+
+      // Embed QR images in the "QR Image" column
+      const qrImageColIndex = columns.findIndex(c => c.key === "qrImage"); // zero-based
+      const pixelSize = 90; // image size in pixels
+      // set row height for visibility (row 1 is header)
+      for (let i = 2; i <= rows.length + 1; i++) {
+        ws.getRow(i).height = 70;
+      }
+
+      for (let i = 0; i < rows.length; i++) {
+        const s = rows[i];
+        const text = s.qrRaw || s.serial || "";
+        if (!text) continue;
+
+        // Generate QR PNG as a buffer
+        // (scale/margin can be tuned; this size fits a 16-width column + 70 row height nicely)
+        const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
+        const imgId = wb.addImage({ buffer: buf, extension: "png" });
+
+        // ExcelJS uses 0-based coordinates for adding images:
+        // Row index in sheet is i+2 (account for header), column index is qrImageColIndex (0-based).
+        ws.addImage(imgId, {
+          tl:  { col: qrImageColIndex, row: i + 1 }, // top-left (row-1 because ExcelJS rows are zero-based here)
+          ext: { width: pixelSize, height: pixelSize },
+        });
+      }
+
+      // Stream response
+      const outName = `Master_QR_${Date.now()}.xlsx`;
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+      await wb.xlsx.write(res);
+      res.end();
+    } catch (e) {
+      console.error("Export (xlsx images) failed:", e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+});
+
+
 // Health check
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, db: fs.existsSync(DB_PATH) });
@@ -300,4 +393,5 @@ app.get("/api/health", (_req, res) => {
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, "0.0.0.0", () => console.log(`✅ Backend + Socket.IO on :${PORT}`));
+
 
