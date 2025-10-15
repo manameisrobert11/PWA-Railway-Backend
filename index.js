@@ -8,6 +8,7 @@ import XLSX from "xlsx";
 import sqlite3pkg from "sqlite3";
 import http from "http";
 import { Server } from "socket.io";
+import QRCode from "qrcode"; // <-- generate PNGs for QR codes
 
 const __dirname = process.cwd();
 const app = express();
@@ -18,7 +19,7 @@ app.use(express.json());
 const DB_PATH = path.join(__dirname, "rail_scans.db");
 const db = new sqlite3pkg.Database(DB_PATH);
 
-// Create table (base schema)
+// Base schema (includes receivedAt/loadedAt + qr columns)
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
@@ -35,36 +36,45 @@ db.serialize(() => {
       railType TEXT,
       spec TEXT,
       lengthM TEXT,
+      qrRaw TEXT,        -- raw QR text captured
+      qrPngPath TEXT,    -- path to generated PNG
       timestamp TEXT
     )
   `);
 });
 
-// Ensure new columns exist for older DBs (auto-migrate)
+// Auto-migrate older DBs to add missing columns
 function ensureColumns() {
   db.all(`PRAGMA table_info(scans)`, (err, cols) => {
-    if (err) {
-      console.error("PRAGMA error:", err);
-      return;
-    }
+    if (err) return console.error("PRAGMA error:", err);
     const names = new Set(cols.map((c) => c.name));
     const alters = [];
     if (!names.has("receivedAt")) alters.push(`ALTER TABLE scans ADD COLUMN receivedAt TEXT;`);
-    if (!names.has("loadedAt")) alters.push(`ALTER TABLE scans ADD COLUMN loadedAt TEXT;`);
+    if (!names.has("loadedAt"))  alters.push(`ALTER TABLE scans ADD COLUMN loadedAt TEXT;`);
+    if (!names.has("qrRaw"))     alters.push(`ALTER TABLE scans ADD COLUMN qrRaw TEXT;`);
+    if (!names.has("qrPngPath")) alters.push(`ALTER TABLE scans ADD COLUMN qrPngPath TEXT;`);
 
     if (alters.length) {
-      db.serialize(() => {
-        alters.forEach((sql) => db.run(sql));
-      });
+      db.serialize(() => alters.forEach((sql) => db.run(sql)));
       console.log("✅ Added missing columns:", alters.join(" "));
     }
   });
+
+  // Harden SQLite against lock stalls (helps avoid 504s)
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+  `);
 }
 ensureColumns();
 
 // --- Upload directory ---
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const QR_DIR = path.join(UPLOAD_DIR, "qrcodes");
+if (!fs.existsSync(QR_DIR)) fs.mkdirSync(QR_DIR, { recursive: true });
+
 const upload = multer({ dest: UPLOAD_DIR });
 
 // --- HTTP + Socket.IO ---
@@ -94,6 +104,7 @@ app.post("/api/scan", (req, res) => {
     railType,
     spec,
     lengthM,
+    qrRaw,       // <-- from frontend: pending.raw (full QR payload string)
     timestamp,
   } = req.body;
 
@@ -103,8 +114,8 @@ app.post("/api/scan", (req, res) => {
 
   const stmt = db.prepare(
     `INSERT INTO scans
-    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt, grade, railType, spec, lengthM, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt, grade, railType, spec, lengthM, qrRaw, qrPngPath, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   stmt.run(
@@ -120,27 +131,47 @@ app.post("/api/scan", (req, res) => {
     railType || "",
     spec || "",
     lengthM || "",
+    qrRaw || "",         // save raw QR text
+    "",                  // qrPngPath placeholder for now
     ts,
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
-      const newScan = {
-        id: this.lastID,
-        serial,
-        stage: stage || "received",
-        operator: operator || "unknown",
-        wagon1Id: wagon1Id || "",
-        wagon2Id: wagon2Id || "",
-        wagon3Id: wagon3Id || "",
-        receivedAt: receivedAt || "",
-        loadedAt: loadedAt || "",
-        grade: grade || "",
-        railType: railType || "",
-        spec: spec || "",
-        lengthM: lengthM || "",
-        timestamp: ts,
-      };
-      io.emit("new-scan", newScan);
-      res.json({ ok: true, id: this.lastID });
+
+      const newId = this.lastID;
+      const pngPath = path.join(QR_DIR, `${newId}.png`);
+      const pngRel = path.relative(__dirname, pngPath).replace(/\\/g, "/"); // relative path for Excel
+
+      // Generate PNG asynchronously, then update the row's path
+      const qrText = qrRaw || serial; // fall back to serial if no raw provided
+      QRCode.toFile(pngPath, qrText, { type: "png", margin: 1, scale: 4 }, (qrErr) => {
+        if (qrErr) {
+          console.error("QR generation failed for id", newId, qrErr);
+        }
+        db.run(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, newId], (upErr) => {
+          if (upErr) console.error("Failed to store qrPngPath:", upErr);
+          const newScan = {
+            id: newId,
+            serial,
+            stage: stage || "received",
+            operator: operator || "unknown",
+            wagon1Id: wagon1Id || "",
+            wagon2Id: wagon2Id || "",
+            wagon3Id: wagon3Id || "",
+            receivedAt: receivedAt || "",
+            loadedAt: loadedAt || "",
+            grade: grade || "",
+            railType: railType || "",
+            spec: spec || "",
+            lengthM: lengthM || "",
+            qrRaw: qrText,
+            qrPngPath: pngRel,
+            timestamp: ts,
+          };
+          io.emit("new-scan", newScan);
+          // Respond immediately after insert/update path
+          res.json({ ok: true, id: newId });
+        });
+      });
     }
   );
 });
@@ -162,6 +193,12 @@ app.delete("/api/staged/:id", (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ error: "Scan not found" });
 
+    // Remove QR PNG if present
+    if (row.qrPngPath) {
+      const abs = path.join(__dirname, row.qrPngPath);
+      fs.existsSync(abs) && fs.unlink(abs, () => {});
+    }
+
     db.run("DELETE FROM scans WHERE id = ?", [scanId], function (err2) {
       if (err2) return res.status(500).json({ error: err2.message });
       io.emit("deleted-scan", { id: scanId });
@@ -172,6 +209,13 @@ app.delete("/api/staged/:id", (req, res) => {
 
 // Clear all scans
 app.post("/api/staged/clear", (_req, res) => {
+  // Clean qrcodes folder (best-effort)
+  if (fs.existsSync(QR_DIR)) {
+    for (const f of fs.readdirSync(QR_DIR)) {
+      const p = path.join(QR_DIR, f);
+      try { fs.unlinkSync(p); } catch {}
+    }
+  }
   db.run("DELETE FROM scans", (err) => {
     if (err) return res.status(500).json({ error: err.message });
     io.emit("cleared-scans");
@@ -184,7 +228,7 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
   res.json({ ok: true, path: req.file?.path });
 });
 
-// Export scans to Excel
+// Export scans to Excel (.xlsm kept, images referenced by path)
 app.post("/api/export-to-excel", (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -207,12 +251,14 @@ app.post("/api/export-to-excel", (_req, res) => {
           Wagon1ID: s.wagon1Id,
           Wagon2ID: s.wagon2Id,
           Wagon3ID: s.wagon3Id,
-          RecievedAt: s.receivedAt, // keep label as requested
+          RecievedAt: s.receivedAt,
           LoadedAt: s.loadedAt,
           Grade: s.grade,
           RailType: s.railType,
           Spec: s.spec,
           Length: s.lengthM,
+          QRText: s.qrRaw || "",
+          QRImagePath: s.qrPngPath || "",  // clickable or usable by VBA macro
           Timestamp: s.timestamp,
         }))
       );
