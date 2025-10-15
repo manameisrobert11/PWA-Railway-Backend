@@ -1,4 +1,4 @@
-// index.js (backend root)
+// index.js  — backend root
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -9,12 +9,22 @@ import sqlite3pkg from "sqlite3";
 import http from "http";
 import { Server } from "socket.io";
 
-// ---------- Optional deps (loaded lazily so app never crashes) ----------
+// ---------- Lazy loaders (so the app runs even if deps aren't installed) ----------
 async function getExcelJS() {
-  try { const m = await import("exceljs"); return m.default || m; } catch { return null; }
+  try {
+    const m = await import("exceljs");
+    return m.default || m;
+  } catch {
+    return null;
+  }
 }
 async function getQRCode() {
-  try { const m = await import("qrcode");  return m.default || m; } catch { return null; }
+  try {
+    const m = await import("qrcode");
+    return m.default || m;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- App + paths ----------
@@ -22,6 +32,12 @@ const __dirname = process.cwd();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Simple request logger (helps verify requests hit THIS server)
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -64,7 +80,7 @@ function bootstrapDb() {
     if (err) return console.error("PRAGMA error:", err);
     const names = new Set(cols.map((c) => c.name));
     const alters = [];
-    for (const col of ["receivedAt","loadedAt","qrRaw","qrPngPath"]) {
+    for (const col of ["receivedAt", "loadedAt", "qrRaw", "qrPngPath"]) {
       if (!names.has(col)) alters.push(`ALTER TABLE scans ADD COLUMN ${col} TEXT;`);
     }
     if (alters.length) {
@@ -90,6 +106,14 @@ io.on("connection", (socket) => {
 });
 
 // ---------- API Routes ----------
+
+// Version + health
+app.get("/api/version", (_req, res) => {
+  res.json({ ok: true, version: "export-xlsx-images-v1" });
+});
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, db: fs.existsSync(DB_PATH) });
+});
 
 // Add a new scan
 app.post("/api/scan", async (req, res) => {
@@ -148,11 +172,20 @@ app.post("/api/scan", async (req, res) => {
 
       const newScan = {
         id: newId,
-        serial, stage: stage || "received", operator: operator || "unknown",
-        wagon1Id: wagon1Id || "", wagon2Id: wagon2Id || "", wagon3Id: wagon3Id || "",
-        receivedAt: receivedAt || "", loadedAt: loadedAt || "",
-        grade: grade || "", railType: railType || "", spec: spec || "", lengthM: lengthM || "",
-        qrRaw: qrText || "", qrPngPath: QRCode ? pngRel : "",
+        serial,
+        stage: stage || "received",
+        operator: operator || "unknown",
+        wagon1Id: wagon1Id || "",
+        wagon2Id: wagon2Id || "",
+        wagon3Id: wagon3Id || "",
+        receivedAt: receivedAt || "",
+        loadedAt: loadedAt || "",
+        grade: grade || "",
+        railType: railType || "",
+        spec: spec || "",
+        lengthM: lengthM || "",
+        qrRaw: qrText || "",
+        qrPngPath: QRCode ? pngRel : "",
         timestamp: ts,
       };
       io.emit("new-scan", newScan);
@@ -208,6 +241,11 @@ app.post("/api/staged/clear", (_req, res) => {
   });
 });
 
+// Upload Excel template (.xlsm)
+app.post("/api/upload-template", upload.single("template"), (req, res) => {
+  res.json({ ok: true, path: req.file?.path });
+});
+
 // Export to .xlsm (uses your template; forces headers so columns always appear)
 app.post("/api/export-to-excel", (_req, res) => {
   try {
@@ -255,11 +293,11 @@ app.post("/api/export-to-excel", (_req, res) => {
   }
 });
 
-// Export to .xlsx with embedded QR images (works without template)
-app.post("/api/export-xlsx-images", async (_req, res) => {
+// Export to .xlsx with embedded QR images (works without template) — accepts GET or POST
+app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) {
-    return res.status(400).json({ error: 'exceljs not installed. Run: npm i exceljs qrcode' });
+    return res.status(400).json({ error: "exceljs not installed. Run: npm i exceljs qrcode" });
   }
   const QRCode = await getQRCode();
 
@@ -312,7 +350,7 @@ app.post("/api/export-xlsx-images", async (_req, res) => {
       for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
 
       if (QRCode) {
-        const qrImageColIndex = columns.findIndex(c => c.key === "qrImage"); // 0-based
+        const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage"); // 0-based
         const pixelSize = 90;
         for (let i = 0; i < rows.length; i++) {
           const text = rows[i].qrRaw || rows[i].serial || "";
@@ -320,14 +358,17 @@ app.post("/api/export-xlsx-images", async (_req, res) => {
           const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
           const imgId = wb.addImage({ buffer: buf, extension: "png" });
           ws.addImage(imgId, {
-            tl:  { col: qrImageColIndex, row: i + 1 }, // 0-based row index
+            tl: { col: qrImageColIndex, row: i + 1 }, // 0-based
             ext: { width: pixelSize, height: pixelSize },
           });
         }
       }
 
       const outName = `Master_QR_${Date.now()}.xlsx`;
-      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
       res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
       await wb.xlsx.write(res);
       res.end();
@@ -336,11 +377,6 @@ app.post("/api/export-xlsx-images", async (_req, res) => {
       res.status(500).json({ error: e.message });
     }
   });
-});
-
-// Health check
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, db: fs.existsSync(DB_PATH) });
 });
 
 // ---------- Start ----------
