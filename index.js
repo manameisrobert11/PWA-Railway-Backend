@@ -8,6 +8,7 @@ import XLSX from "xlsx";
 import sqlite3pkg from "sqlite3";
 import http from "http";
 import { Server } from "socket.io";
+import ExcelJS from "exceljs";
 import QRCode from "qrcode"; // <-- generate PNGs for QR codes
 
 const __dirname = process.cwd();
@@ -223,12 +224,7 @@ app.post("/api/staged/clear", (_req, res) => {
   });
 });
 
-// Upload Excel template
-app.post("/api/upload-template", upload.single("template"), (req, res) => {
-  res.json({ ok: true, path: req.file?.path });
-});
-
-// Export scans to Excel (.xlsm kept, images referenced by path)
+// Export scans to Excel (.xlsm). Overwrite the first sheet with fixed headers
 app.post("/api/export-to-excel", (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -237,39 +233,57 @@ app.post("/api/export-to-excel", (_req, res) => {
 
     const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
     const sheetName = wb.SheetNames[0];
-    const ws = wb.Sheets[sheetName];
-    const existing = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+    // Fixed header order we guarantee every time:
+    const HEADERS = [
+      "Serial",
+      "Stage",
+      "Operator",
+      "Wagon1ID",
+      "Wagon2ID",
+      "Wagon3ID",
+      "RecievedAt",
+      "LoadedAt",
+      "Grade",
+      "RailType",
+      "Spec",
+      "Length",
+      "QRText",
+      "QRImagePath",
+      "Timestamp",
+    ];
 
     db.all("SELECT * FROM scans ORDER BY id ASC", (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      const appended = existing.concat(
-        rows.map((s) => ({
-          Serial: s.serial,
-          Stage: s.stage,
-          Operator: s.operator,
-          Wagon1ID: s.wagon1Id,
-          Wagon2ID: s.wagon2Id,
-          Wagon3ID: s.wagon3Id,
-          RecievedAt: s.receivedAt,
-          LoadedAt: s.loadedAt,
-          Grade: s.grade,
-          RailType: s.railType,
-          Spec: s.spec,
-          Length: s.lengthM,
-          QRText: s.qrRaw || "",
-          QRImagePath: s.qrPngPath || "",  // clickable or usable by VBA macro
-          Timestamp: s.timestamp,
-        }))
-      );
+      // Build AOA data: first row = headers, the rest = values in the exact order
+      const dataRows = rows.map((s) => ([
+        s.serial || "",
+        s.stage || "",
+        s.operator || "",
+        s.wagon1Id || "",
+        s.wagon2Id || "",
+        s.wagon3Id || "",
+        s.receivedAt || "",
+        s.loadedAt || "",
+        s.grade || "",
+        s.railType || "",
+        s.spec || "",
+        s.lengthM || "",
+        s.qrRaw || "",       // raw qr text we saved
+        s.qrPngPath || "",   // path to PNG (if you installed qrcode)
+        s.timestamp || "",
+      ]));
 
-      const newWs = XLSX.utils.json_to_sheet(appended, { skipHeader: false });
+      const aoa = [HEADERS, ...dataRows];
+
+      // Create a fresh sheet with our headers+rows and replace the first sheet
+      const newWs = XLSX.utils.aoa_to_sheet(aoa);
       wb.Sheets[sheetName] = newWs;
 
       const outName = `Master_${Date.now()}.xlsm`;
       const outPath = path.join(UPLOAD_DIR, outName);
       XLSX.writeFile(wb, outPath, { bookType: "xlsm", bookVBA: true });
-
       res.download(outPath, outName);
     });
   } catch (err) {
@@ -286,3 +300,4 @@ app.get("/api/health", (_req, res) => {
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, "0.0.0.0", () => console.log(`✅ Backend + Socket.IO on :${PORT}`));
+
