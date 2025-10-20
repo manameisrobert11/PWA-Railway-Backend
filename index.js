@@ -1,4 +1,4 @@
-// index.js  — backend root
+// index.js — backend root
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -74,7 +74,7 @@ db.serialize(() => {
   `);
 });
 
-// Auto-migrate + harden SQLite (prevents lock stalls/504s)
+// Auto-migrate + harden SQLite (prevents lock stalls)
 function bootstrapDb() {
   db.all(`PRAGMA table_info(scans)`, (err, cols) => {
     if (err) return console.error("PRAGMA error:", err);
@@ -105,11 +105,14 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => console.log("Client disconnected:", socket.id));
 });
 
+// ---------- Helpers ----------
+const dateOnlyFromTs = (ts) => (ts ? String(ts).slice(0, 10) : "");
+
 // ---------- API Routes ----------
 
 // Version + health
 app.get("/api/version", (_req, res) => {
-  res.json({ ok: true, version: "export-xlsx-images-v1" });
+  res.json({ ok: true, version: "export-date-no-qrtext-v2" });
 });
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, db: fs.existsSync(DB_PATH) });
@@ -148,7 +151,7 @@ app.post("/api/scan", async (req, res) => {
     railType || "",
     spec || "",
     lengthM || "",
-    qrRaw || "",  // save raw QR text
+    qrRaw || "",  // save raw QR text (even if we don't export it as a column)
     "",           // placeholder for png path
     ts,
     async function (err) {
@@ -247,6 +250,7 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
 });
 
 // Export to .xlsm (uses your template; forces headers so columns always appear)
+// NOTE: "QRText" removed — replaced by "Date" (YYYY-MM-DD derived from timestamp)
 app.post("/api/export-to-excel", (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -262,21 +266,27 @@ app.post("/api/export-to-excel", (_req, res) => {
       "Wagon1ID","Wagon2ID","Wagon3ID",
       "RecievedAt","LoadedAt",
       "Grade","RailType","Spec","Length",
-      "QRText","QRImagePath",
-      "Timestamp",
+      "Date",          // <-- replaced QRText
+      "QRImagePath",   // xlsm can't embed images; keep the path for reference
+      "Timestamp"
     ];
 
     db.all("SELECT * FROM scans ORDER BY id ASC", (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      const dataRows = rows.map((s) => ([
-        s.serial || "", s.stage || "", s.operator || "",
-        s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
-        s.receivedAt || "", s.loadedAt || "",
-        s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
-        s.qrRaw || "", s.qrPngPath || "",
-        s.timestamp || "",
-      ]));
+      const dataRows = rows.map((s) => {
+        const ts = s.timestamp || "";
+        const dateOnly = dateOnlyFromTs(ts);
+        return [
+          s.serial || "", s.stage || "", s.operator || "",
+          s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
+          s.receivedAt || "", s.loadedAt || "",
+          s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
+          dateOnly,             // <-- Date column
+          s.qrPngPath || "",    // path only
+          ts
+        ];
+      });
 
       const aoa = [HEADERS, ...dataRows];
       const newWs = XLSX.utils.aoa_to_sheet(aoa);
@@ -294,6 +304,7 @@ app.post("/api/export-to-excel", (_req, res) => {
 });
 
 // Export to .xlsx with embedded QR images (works without template) — accepts GET or POST
+// NOTE: "QRText" removed — replaced by "Date" (from timestamp)
 app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) {
@@ -321,13 +332,17 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
         { header: "RailType",    key: "railType",    width: 12 },
         { header: "Spec",        key: "spec",        width: 18 },
         { header: "Length",      key: "lengthM",     width: 10 },
-        { header: "QRText",      key: "qrRaw",       width: 42 },
-        { header: "QR Image",    key: "qrImage",     width: 16 },
+        { header: "Date",        key: "dateOnly",    width: 14 }, // <-- Date column
+        { header: "QR Image",    key: "qrImage",     width: 16 }, // images embedded here
         { header: "Timestamp",   key: "timestamp",   width: 24 },
       ];
       ws.columns = columns;
 
+      // Rows (no QR text; include dateOnly derived from timestamp)
       rows.forEach((s) => {
+        const ts = s.timestamp || "";
+        const dateOnly = dateOnlyFromTs(ts);
+
         ws.addRow({
           serial:     s.serial || "",
           stage:      s.stage || "",
@@ -341,14 +356,16 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
           railType:   s.railType || "",
           spec:       s.spec || "",
           lengthM:    s.lengthM || "",
-          qrRaw:      s.qrRaw || s.serial || "",
-          qrImage:    "",
-          timestamp:  s.timestamp || "",
+          dateOnly,                 // <-- new Date field
+          qrImage:    "",           // placeholder; image added below
+          timestamp:  ts,
         });
       });
+
       ws.getRow(1).font = { bold: true };
       for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
 
+      // Embed QR images based on qrRaw (or serial fallback); no text column needed
       if (QRCode) {
         const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage"); // 0-based
         const pixelSize = 90;
@@ -358,7 +375,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
           const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
           const imgId = wb.addImage({ buffer: buf, extension: "png" });
           ws.addImage(imgId, {
-            tl: { col: qrImageColIndex, row: i + 1 }, // 0-based
+            tl:  { col: qrImageColIndex, row: i + 1 }, // 0-based
             ext: { width: pixelSize, height: pixelSize },
           });
         }
