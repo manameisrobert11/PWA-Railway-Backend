@@ -1,4 +1,4 @@
-// index.js — backend root
+// index.js — Backend root (Express + SQLite + Excel export + QR images + pagination + bulk ingest)
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -33,7 +33,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Simple request logger (helps verify requests hit THIS server)
+// Simple request logger
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
@@ -50,7 +50,7 @@ const upload = multer({ dest: UPLOAD_DIR });
 const DB_PATH = path.join(__dirname, "rail_scans.db");
 const db = new sqlite3pkg.Database(DB_PATH);
 
-// Base schema
+// Base schema (includes receivedAt/loadedAt + qr fields)
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
@@ -74,7 +74,7 @@ db.serialize(() => {
   `);
 });
 
-// Auto-migrate + harden SQLite (prevents lock stalls)
+// Auto-migrate + harden SQLite + helpful indexes (idempotent)
 function bootstrapDb() {
   db.all(`PRAGMA table_info(scans)`, (err, cols) => {
     if (err) return console.error("PRAGMA error:", err);
@@ -88,11 +88,16 @@ function bootstrapDb() {
       console.log("✅ Added missing columns:", alters.join(" "));
     }
   });
+
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
   `);
+
+  // Indexes (safe to re-run)
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS ux_scans_serial ON scans(serial)`);
+  db.run(`CREATE INDEX IF NOT EXISTS ix_scans_timestamp ON scans(timestamp)`);
 }
 bootstrapDb();
 
@@ -105,20 +110,17 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => console.log("Client disconnected:", socket.id));
 });
 
-// ---------- Helpers ----------
-const dateOnlyFromTs = (ts) => (ts ? String(ts).slice(0, 10) : "");
-
 // ---------- API Routes ----------
 
 // Version + health
 app.get("/api/version", (_req, res) => {
-  res.json({ ok: true, version: "export-date-no-qrtext-v2" });
+  res.json({ ok: true, version: "export-xlsx-images-v2" });
 });
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, db: fs.existsSync(DB_PATH) });
 });
 
-// Add a new scan
+// Add a new scan (online save; offline queue will bulk post later)
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
@@ -132,7 +134,7 @@ app.post("/api/scan", async (req, res) => {
   const ts = timestamp || new Date().toISOString();
 
   const stmt = db.prepare(
-    `INSERT INTO scans
+    `INSERT OR IGNORE INTO scans
       (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt,
        grade, railType, spec, lengthM, qrRaw, qrPngPath, timestamp)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -151,29 +153,29 @@ app.post("/api/scan", async (req, res) => {
     railType || "",
     spec || "",
     lengthM || "",
-    qrRaw || "",  // save raw QR text (even if we don't export it as a column)
-    "",           // placeholder for png path
+    qrRaw || "",
+    "", // placeholder for png path
     ts,
     async function (err) {
       if (err) return res.status(500).json({ error: err.message });
 
-      const newId = this.lastID;
-      const qrText = qrRaw || serial;
-      const pngPath = path.join(QR_DIR, `${newId}.png`);
-      const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
+      // If it was ignored (duplicate), still return ok (id undefined)
+      const newId = this.lastID || null;
 
-      // Try to generate PNG (skip if library missing)
+      // Try to generate QR PNG (optional)
       const QRCode = await getQRCode();
-      if (QRCode && qrText) {
+      if (QRCode && (qrRaw || serial) && newId) {
         try {
-          await QRCode.toFile(pngPath, qrText, { type: "png", margin: 1, scale: 4 });
+          const pngPath = path.join(QR_DIR, `${newId}.png`);
+          const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
+          await QRCode.toFile(pngPath, qrRaw || serial, { type: "png", margin: 1, scale: 4 });
           db.run(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, newId]);
         } catch (e) {
           console.warn("QR PNG generation failed:", e.message);
         }
       }
 
-      const newScan = {
+      io.emit("new-scan", {
         id: newId,
         serial,
         stage: stage || "received",
@@ -187,21 +189,106 @@ app.post("/api/scan", async (req, res) => {
         railType: railType || "",
         spec: spec || "",
         lengthM: lengthM || "",
-        qrRaw: qrText || "",
-        qrPngPath: QRCode ? pngRel : "",
+        qrRaw: qrRaw || "",
         timestamp: ts,
-      };
-      io.emit("new-scan", newScan);
+      });
+
       res.json({ ok: true, id: newId });
     }
   );
 });
 
-// Get all scans
-app.get("/api/staged", (_req, res) => {
-  db.all(`SELECT * FROM scans ORDER BY id DESC`, (err, rows) => {
+// Bulk ingest (used by offline sync)
+app.post("/api/scans/bulk", (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
+
+  db.serialize(() => {
+    db.run("BEGIN TRANSACTION");
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO scans
+      (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt,
+       grade, railType, spec, lengthM, qrRaw, qrPngPath, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    let inserted = 0, skipped = 0;
+    for (const r of items) {
+      stmt.run([
+        String(r.serial || ""),
+        r.stage || "received",
+        r.operator || "unknown",
+        r.wagon1Id || "",
+        r.wagon2Id || "",
+        r.wagon3Id || "",
+        r.receivedAt || "",
+        r.loadedAt || "",
+        r.grade || "",
+        r.railType || "",
+        r.spec || "",
+        r.lengthM || "",
+        r.qrRaw || "",
+        "", // qrPngPath optional
+        r.timestamp || new Date().toISOString(),
+      ], function(err){
+        if (err) skipped++;
+        else if (this.changes === 1) inserted++;
+        else skipped++;
+      });
+    }
+
+    stmt.finalize((finalErr) => {
+      if (finalErr) {
+        db.run("ROLLBACK");
+        return res.status(500).json({ error: finalErr.message });
+      }
+      db.run("COMMIT", () => res.json({ ok: true, inserted, skipped }));
+    });
+  });
+});
+
+// Pagination + count (scalable)
+app.get("/api/staged", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+  const cursor = req.query.cursor ? parseInt(req.query.cursor, 10) : null;
+  const dir = (req.query.dir || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+
+  const where =
+    cursor != null
+      ? (dir === "DESC" ? "WHERE id < ?" : "WHERE id > ?")
+      : "";
+
+  const params = cursor != null ? [cursor] : [];
+
+  const sql = `
+    SELECT * FROM scans
+    ${where}
+    ORDER BY id ${dir}
+    LIMIT ${limit}
+  `;
+
+  db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+
+    const nextCursor =
+      rows.length > 0
+        ? rows[rows.length - 1].id
+        : null;
+
+    db.get(`SELECT COUNT(*) AS c FROM scans`, (_, countRow) => {
+      res.json({
+        rows,
+        nextCursor,
+        total: countRow?.c ?? 0,
+      });
+    });
+  });
+});
+
+app.get("/api/staged/count", (_req, res) => {
+  db.get(`SELECT COUNT(*) AS c FROM scans`, (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ count: row.c });
   });
 });
 
@@ -249,8 +336,7 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
   res.json({ ok: true, path: req.file?.path });
 });
 
-// Export to .xlsm (uses your template; forces headers so columns always appear)
-// NOTE: "QRText" removed — replaced by "Date" (YYYY-MM-DD derived from timestamp)
+// Export to .xlsm (macro-enabled; fixed headers so columns always appear)
 app.post("/api/export-to-excel", (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -266,27 +352,21 @@ app.post("/api/export-to-excel", (_req, res) => {
       "Wagon1ID","Wagon2ID","Wagon3ID",
       "RecievedAt","LoadedAt",
       "Grade","RailType","Spec","Length",
-      "Date",          // <-- replaced QRText
-      "QRImagePath",   // xlsm can't embed images; keep the path for reference
-      "Timestamp"
+      "QRText","QRImagePath",
+      "Timestamp",
     ];
 
     db.all("SELECT * FROM scans ORDER BY id ASC", (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      const dataRows = rows.map((s) => {
-        const ts = s.timestamp || "";
-        const dateOnly = dateOnlyFromTs(ts);
-        return [
-          s.serial || "", s.stage || "", s.operator || "",
-          s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
-          s.receivedAt || "", s.loadedAt || "",
-          s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
-          dateOnly,             // <-- Date column
-          s.qrPngPath || "",    // path only
-          ts
-        ];
-      });
+      const dataRows = rows.map((s) => ([
+        s.serial || "", s.stage || "", s.operator || "",
+        s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
+        s.receivedAt || "", s.loadedAt || "",
+        s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
+        s.qrRaw || "", s.qrPngPath || "",
+        s.timestamp || "",
+      ]));
 
       const aoa = [HEADERS, ...dataRows];
       const newWs = XLSX.utils.aoa_to_sheet(aoa);
@@ -303,8 +383,8 @@ app.post("/api/export-to-excel", (_req, res) => {
   }
 });
 
-// Export to .xlsx with embedded QR images (works without template) — accepts GET or POST
-// NOTE: "QRText" removed — replaced by "Date" (from timestamp)
+// Export to .xlsx with embedded QR images (no template)
+// Accepts GET or POST so Netlify/Render proxies are happy
 app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) {
@@ -332,17 +412,13 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
         { header: "RailType",    key: "railType",    width: 12 },
         { header: "Spec",        key: "spec",        width: 18 },
         { header: "Length",      key: "lengthM",     width: 10 },
-        { header: "Date",        key: "dateOnly",    width: 14 }, // <-- Date column
-        { header: "QR Image",    key: "qrImage",     width: 16 }, // images embedded here
+        { header: "QRText",      key: "qrRaw",       width: 42 },
+        { header: "QR Image",    key: "qrImage",     width: 16 },
         { header: "Timestamp",   key: "timestamp",   width: 24 },
       ];
       ws.columns = columns;
 
-      // Rows (no QR text; include dateOnly derived from timestamp)
       rows.forEach((s) => {
-        const ts = s.timestamp || "";
-        const dateOnly = dateOnlyFromTs(ts);
-
         ws.addRow({
           serial:     s.serial || "",
           stage:      s.stage || "",
@@ -356,16 +432,14 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
           railType:   s.railType || "",
           spec:       s.spec || "",
           lengthM:    s.lengthM || "",
-          dateOnly,                 // <-- new Date field
-          qrImage:    "",           // placeholder; image added below
-          timestamp:  ts,
+          qrRaw:      s.qrRaw || s.serial || "",
+          qrImage:    "",
+          timestamp:  s.timestamp || "",
         });
       });
-
       ws.getRow(1).font = { bold: true };
       for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
 
-      // Embed QR images based on qrRaw (or serial fallback); no text column needed
       if (QRCode) {
         const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage"); // 0-based
         const pixelSize = 90;
@@ -375,7 +449,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
           const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
           const imgId = wb.addImage({ buffer: buf, extension: "png" });
           ws.addImage(imgId, {
-            tl:  { col: qrImageColIndex, row: i + 1 }, // 0-based
+            tl: { col: qrImageColIndex, row: i + 1 }, // 0-based
             ext: { width: pixelSize, height: pixelSize },
           });
         }
