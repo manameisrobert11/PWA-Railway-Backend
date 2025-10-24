@@ -93,6 +93,8 @@ function bootstrapDb() {
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA cache_size = -16000; -- ~16MB cache
   `);
 
   // Indexes (safe to re-run)
@@ -100,6 +102,17 @@ function bootstrapDb() {
   db.run(`CREATE INDEX IF NOT EXISTS ix_scans_timestamp ON scans(timestamp)`);
 }
 bootstrapDb();
+
+// ---------- Prepared statements (reuse under load) ----------
+const insertScanStmt = db.prepare(
+  `INSERT OR IGNORE INTO scans
+   (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt,
+    grade, railType, spec, lengthM, qrRaw, qrPngPath, timestamp)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+);
+process.on("exit", () => {
+  try { insertScanStmt.finalize(); } catch {}
+});
 
 // ---------- HTTP + Socket.IO ----------
 const server = http.createServer(app);
@@ -120,7 +133,7 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, db: fs.existsSync(DB_PATH) });
 });
 
-// Add a new scan (online save; offline queue will bulk post later)
+// Add a new scan (online save; optimized for multi-device: immediate reply, PNG in background)
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
@@ -133,14 +146,7 @@ app.post("/api/scan", async (req, res) => {
   if (!serial) return res.status(400).json({ error: "Serial required" });
   const ts = timestamp || new Date().toISOString();
 
-  const stmt = db.prepare(
-    `INSERT OR IGNORE INTO scans
-      (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id, receivedAt, loadedAt,
-       grade, railType, spec, lengthM, qrRaw, qrPngPath, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-
-  stmt.run(
+  insertScanStmt.run(
     String(serial),
     stage || "received",
     operator || "unknown",
@@ -159,22 +165,10 @@ app.post("/api/scan", async (req, res) => {
     async function (err) {
       if (err) return res.status(500).json({ error: err.message });
 
-      // If it was ignored (duplicate), still return ok (id undefined)
+      // If it was ignored (duplicate), lastID may be undefined/null
       const newId = this.lastID || null;
 
-      // Try to generate QR PNG (optional)
-      const QRCode = await getQRCode();
-      if (QRCode && (qrRaw || serial) && newId) {
-        try {
-          const pngPath = path.join(QR_DIR, `${newId}.png`);
-          const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
-          await QRCode.toFile(pngPath, qrRaw || serial, { type: "png", margin: 1, scale: 4 });
-          db.run(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, newId]);
-        } catch (e) {
-          console.warn("QR PNG generation failed:", e.message);
-        }
-      }
-
+      // Emit immediately so other clients update fast
       io.emit("new-scan", {
         id: newId,
         serial,
@@ -193,7 +187,21 @@ app.post("/api/scan", async (req, res) => {
         timestamp: ts,
       });
 
+      // ✅ Respond to client immediately (do not block on PNG generation)
       res.json({ ok: true, id: newId });
+
+      // 🧵 Background: generate QR PNG (best-effort)
+      try {
+        const QRCode = await getQRCode();
+        if (QRCode && (qrRaw || serial) && newId) {
+          const pngPath = path.join(QR_DIR, `${newId}.png`);
+          const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
+          await QRCode.toFile(pngPath, qrRaw || serial, { type: "png", margin: 1, scale: 4 });
+          db.run(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, newId]);
+        }
+      } catch (e) {
+        console.warn("QR PNG generation failed:", e.message);
+      }
     }
   );
 });
@@ -292,7 +300,7 @@ app.get("/api/staged/count", (_req, res) => {
   });
 });
 
-// Delete a scan
+// Delete a scan (emits to all clients)
 app.delete("/api/staged/:id", (req, res) => {
   const scanId = req.params.id;
   if (!scanId) return res.status(400).json({ error: "Scan ID required" });
@@ -315,7 +323,7 @@ app.delete("/api/staged/:id", (req, res) => {
   });
 });
 
-// Clear all scans
+// Clear all scans (emits)
 app.post("/api/staged/clear", (_req, res) => {
   // clean qrcodes folder
   if (fs.existsSync(QR_DIR)) {
