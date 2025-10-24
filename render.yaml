@@ -1,17 +1,17 @@
 services:
   # ------------------------------
-  # MySQL Database (Private Service)
+  # MySQL (Private Service)
   # ------------------------------
-  - type: private_service
+  - type: pserv
     name: mysql-rail
-    env: docker
-    plan: starter         # Cheapest plan with persistent disk
-    region: oregon        # You can change to your region
+    runtime: docker
+    plan: starter
+    region: oregon
     dockerfilePath: ./mysql/Dockerfile
     disk:
       name: mysql-data
       mountPath: /var/lib/mysql
-      sizeGB: 10          # Storage for your DB (10 GB)
+      sizeGB: 10
     envVars:
       - key: MYSQL_ROOT_PASSWORD
         fromSecret: mysql-root-password
@@ -19,11 +19,11 @@ services:
         value: rail
 
   # ------------------------------
-  # Backend API (Node.js)
+  # Backend API (Node.js Web Service)
   # ------------------------------
   - type: web
     name: rail-backend
-    env: node
+    runtime: node
     plan: starter
     region: oregon
     buildCommand: npm ci
@@ -31,7 +31,7 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      # Internal connection to MySQL
+      # Connect to the private MySQL via Render's private network
       - key: MYSQL_HOST
         value: mysql-rail
       - key: MYSQL_PORT
@@ -44,6 +44,6 @@ services:
         value: rail
       - key: NODE_ENV
         value: production
-      # Optional CORS control for your frontend
+      # Optional CORS for your frontend
       - key: CORS_ORIGIN
         value: "*"
