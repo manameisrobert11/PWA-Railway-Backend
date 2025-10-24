@@ -13,8 +13,9 @@ services:
       mountPath: /var/lib/mysql
       sizeGB: 10
     envVars:
-      - key: MYSQL_ROOT_PASSWORD
-        fromSecret: mysql-root-password
+      # Attach the secret group (you'll create it in the UI)
+      - fromGroup: rail-secrets
+      # DB name to auto-create
       - key: MYSQL_DATABASE
         value: rail
 
@@ -31,19 +32,18 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      # Connect to the private MySQL via Render's private network
+      # Attach the same secret group so backend gets the passwords
+      - fromGroup: rail-secrets
+      # Internal connection to MySQL over Render's private network
       - key: MYSQL_HOST
         value: mysql-rail
       - key: MYSQL_PORT
         value: 3306
       - key: MYSQL_USER
         value: root
-      - key: MYSQL_PASSWORD
-        fromSecret: mysql-root-password
       - key: MYSQL_DATABASE
         value: rail
       - key: NODE_ENV
         value: production
-      # Optional CORS for your frontend
       - key: CORS_ORIGIN
         value: "*"
