@@ -12,10 +12,10 @@ services:
       name: mysql-data
       mountPath: /var/lib/mysql
       sizeGB: 10
+    # Attach the secret group you created in the UI
+    envVarGroups:
+      - rail-secrets
     envVars:
-      # Attach the secret group (you'll create it in the UI)
-      - fromGroup: rail-secrets
-      # DB name to auto-create
       - key: MYSQL_DATABASE
         value: rail
 
@@ -31,10 +31,10 @@ services:
     startCommand: node index.js
     healthCheckPath: /api/health
     autoDeploy: true
+    # Attach the same secret group so backend gets passwords
+    envVarGroups:
+      - rail-secrets
     envVars:
-      # Attach the same secret group so backend gets the passwords
-      - fromGroup: rail-secrets
-      # Internal connection to MySQL over Render's private network
       - key: MYSQL_HOST
         value: mysql-rail
       - key: MYSQL_PORT
