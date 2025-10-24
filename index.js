@@ -1,6 +1,4 @@
-// index.js — Express + Postgres + Excel export + QR images + pagination + bulk ingest
-// Concurrency-friendly: uses PostgreSQL with pooled connections & ON CONFLICT upserts.
-
+// index.js — Express + MySQL + Excel export + QR images + pagination + bulk ingest
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -9,8 +7,7 @@ import multer from "multer";
 import XLSX from "xlsx";
 import http from "http";
 import { Server } from "socket.io";
-import pkg from "pg";
-const { Pool } = pkg;
+import mysql from "mysql2/promise";
 
 // ---------- Lazy loaders (optional dependencies) ----------
 async function getExcelJS() {
@@ -32,39 +29,64 @@ const QR_DIR = path.join(UPLOAD_DIR, "qrcodes");
 if (!fs.existsSync(QR_DIR)) fs.mkdirSync(QR_DIR, { recursive: true });
 const upload = multer({ dest: UPLOAD_DIR });
 
-// ---------- Postgres ----------
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // ssl: { rejectUnauthorized: false }, // enable if your provider requires SSL
+// ---------- MySQL pool ----------
+function cfgFromUrl(url) {
+  const u = new URL(url);
+  return {
+    host: u.hostname,
+    port: Number(u.port || 3306),
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    database: u.pathname.replace(/^\//, ""),
+    ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : undefined,
+  };
+}
+
+const baseConfig = process.env.MYSQL_URL
+  ? cfgFromUrl(process.env.MYSQL_URL)
+  : {
+      host: process.env.MYSQL_HOST || "localhost",
+      port: Number(process.env.MYSQL_PORT || 3306),
+      user: process.env.MYSQL_USER,
+      password: process.env.MYSQL_PASSWORD,
+      database: process.env.MYSQL_DATABASE,
+      ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : undefined,
+    };
+
+export const pool = mysql.createPool({
+  ...baseConfig,
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,
 });
 
 // Bootstrap schema (idempotent)
 async function bootstrapDb() {
-  const client = await pool.connect();
+  const conn = await pool.getConnection();
   try {
-    await client.query(`
+    await conn.query(`
       CREATE TABLE IF NOT EXISTS scans (
-        id          BIGSERIAL PRIMARY KEY,
-        serial      TEXT UNIQUE,
-        stage       TEXT,
-        operator    TEXT,
-        wagon1Id    TEXT,
-        wagon2Id    TEXT,
-        wagon3Id    TEXT,
-        receivedAt  TEXT,
-        loadedAt    TEXT,
-        grade       TEXT,
-        railType    TEXT,
-        spec        TEXT,
-        lengthM     TEXT,
+        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        serial      VARCHAR(191) UNIQUE,
+        stage       VARCHAR(64),
+        operator    VARCHAR(128),
+        wagon1Id    VARCHAR(128),
+        wagon2Id    VARCHAR(128),
+        wagon3Id    VARCHAR(128),
+        receivedAt  VARCHAR(64),
+        loadedAt    VARCHAR(64),
+        grade       VARCHAR(64),
+        railType    VARCHAR(64),
+        spec        VARCHAR(128),
+        lengthM     VARCHAR(32),
         qrRaw       TEXT,
         qrPngPath   TEXT,
-        timestamp   TIMESTAMPTZ
+        timestamp   DATETIME
       );
-      CREATE INDEX IF NOT EXISTS ix_scans_timestamp ON scans(timestamp);
     `);
+    await conn.query(`CREATE INDEX IF NOT EXISTS ix_scans_timestamp ON scans (timestamp);`);
   } finally {
-    client.release();
+    conn.release();
   }
 }
 await bootstrapDb();
@@ -73,9 +95,7 @@ await bootstrapDb();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-io.on("connection", (socket) => {
-  // console.log("socket connected", socket.id);
-});
+io.on("connection", () => { /* socket connected */ });
 
 // ---------- Helpers ----------
 async function generateQrPngAndPersist(id, text) {
@@ -85,7 +105,7 @@ async function generateQrPngAndPersist(id, text) {
     const pngPath = path.join(QR_DIR, `${id}.png`);
     const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
     await QRCode.toFile(pngPath, text, { type: "png", margin: 1, scale: 4 });
-    await pool.query(`UPDATE scans SET "qrPngPath"=$1 WHERE id=$2`, [pngRel, id]);
+    await pool.query(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, id]);
   } catch (e) {
     console.warn("QR PNG generation failed:", e.message);
   }
@@ -95,7 +115,7 @@ async function generateQrPngAndPersist(id, text) {
 
 // Version + health
 app.get("/api/version", (_req, res) => {
-  res.json({ ok: true, version: "pg-v1" });
+  res.json({ ok: true, version: "mysql-v1" });
 });
 app.get("/api/health", async (_req, res) => {
   try {
@@ -106,8 +126,8 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-// Add a new scan — concurrent, fast. Uses ON CONFLICT to ignore duplicates by serial.
-// Responds immediately; QR PNG generated in background.
+// Add a new scan — MySQL upsert variant.
+// Uses ON DUPLICATE KEY UPDATE as a no-op to preserve existing row.
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
@@ -121,15 +141,14 @@ app.post("/api/scan", async (req, res) => {
 
   const ts = timestamp ? new Date(timestamp) : new Date();
   try {
-    const q = `
+    const sql = `
       INSERT INTO scans
-        (serial, stage, operator, "wagon1Id", "wagon2Id", "wagon3Id",
-         "receivedAt", "loadedAt", grade, "railType", spec, "lengthM",
-         "qrRaw", "qrPngPath", timestamp)
+        (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id,
+         receivedAt, loadedAt, grade, railType, spec, lengthM,
+         qrRaw, qrPngPath, timestamp)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'',$14)
-      ON CONFLICT (serial) DO NOTHING
-      RETURNING id
+        (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
+      ON DUPLICATE KEY UPDATE id = id
     `;
     const vals = [
       String(serial),
@@ -147,22 +166,35 @@ app.post("/api/scan", async (req, res) => {
       qrRaw || "",
       ts,
     ];
-    const { rows } = await pool.query(q, vals);
-    const newId = rows[0]?.id ?? null;
+    const [result] = await pool.execute(sql, vals);
 
-    // Emit immediately (even if duplicate, other clients may already have it)
+    // If inserted, we have insertId. If duplicate, fetch existing id by serial.
+    let newId = result.insertId || null;
+    if (!newId) {
+      const [r2] = await pool.query(`SELECT id FROM scans WHERE serial = ? LIMIT 1`, [String(serial)]);
+      newId = r2[0]?.id ?? null;
+    }
+
     io.emit("new-scan", {
       id: newId,
-      serial, stage: stage || "received", operator: operator || "unknown",
-      wagon1Id: wagon1Id || "", wagon2Id: wagon2Id || "", wagon3Id: wagon3Id || "",
-      receivedAt: receivedAt || "", loadedAt: loadedAt || "",
-      grade: grade || "", railType: railType || "", spec: spec || "", lengthM: lengthM || "",
-      qrRaw: qrRaw || "", timestamp: ts.toISOString(),
+      serial: String(serial),
+      stage: stage || "received",
+      operator: operator || "unknown",
+      wagon1Id: wagon1Id || "",
+      wagon2Id: wagon2Id || "",
+      wagon3Id: wagon3Id || "",
+      receivedAt: receivedAt || "",
+      loadedAt: loadedAt || "",
+      grade: grade || "",
+      railType: railType || "",
+      spec: spec || "",
+      lengthM: lengthM || "",
+      qrRaw: qrRaw || "",
+      timestamp: ts.toISOString(),
     });
 
     res.json({ ok: true, id: newId });
 
-    // Background QR png (only if actually inserted)
     if (newId) generateQrPngAndPersist(newId, qrRaw || serial);
   } catch (e) {
     console.error(e);
@@ -170,25 +202,26 @@ app.post("/api/scan", async (req, res) => {
   }
 });
 
-// Bulk ingest — ON CONFLICT DO NOTHING for duplicates; runs inside a transaction.
+// Bulk ingest — transactional, ignore duplicates by serial.
 app.post("/api/scans/bulk", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
 
-  const client = await pool.connect();
+  const conn = await pool.getConnection();
   let inserted = 0, skipped = 0;
   try {
-    await client.query("BEGIN");
+    await conn.beginTransaction();
+
     const text = `
       INSERT INTO scans
-        (serial, stage, operator, "wagon1Id", "wagon2Id", "wagon3Id",
-         "receivedAt", "loadedAt", grade, "railType", spec, "lengthM",
-         "qrRaw", "qrPngPath", timestamp)
+        (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id,
+         receivedAt, loadedAt, grade, railType, spec, lengthM,
+         qrRaw, qrPngPath, timestamp)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'',$14)
-      ON CONFLICT (serial) DO NOTHING
-      RETURNING id
+        (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
+      ON DUPLICATE KEY UPDATE id = id
     `;
+
     for (const r of items) {
       const vals = [
         String(r.serial || ""),
@@ -206,9 +239,14 @@ app.post("/api/scans/bulk", async (req, res) => {
         r.qrRaw || "",
         r.timestamp ? new Date(r.timestamp) : new Date(),
       ];
+
       try {
-        const { rows } = await client.query(text, vals);
-        const id = rows[0]?.id;
+        const [result] = await conn.execute(text, vals);
+        let id = result.insertId || null;
+        if (!id && r.serial) {
+          const [r2] = await conn.query(`SELECT id FROM scans WHERE serial = ? LIMIT 1`, [String(r.serial)]);
+          id = r2[0]?.id ?? null;
+        }
         if (id) {
           inserted++;
           io.emit("new-scan", {
@@ -228,7 +266,6 @@ app.post("/api/scans/bulk", async (req, res) => {
             qrRaw: r.qrRaw || "",
             timestamp: (r.timestamp ? new Date(r.timestamp) : new Date()).toISOString(),
           });
-          // Fire-and-forget png
           generateQrPngAndPersist(id, r.qrRaw || r.serial || "").catch(()=>{});
         } else {
           skipped++;
@@ -237,14 +274,15 @@ app.post("/api/scans/bulk", async (req, res) => {
         skipped++;
       }
     }
-    await client.query("COMMIT");
+
+    await conn.commit();
     res.json({ ok: true, inserted, skipped });
   } catch (e) {
-    await client.query("ROLLBACK");
+    await conn.rollback();
     console.error(e);
     res.status(500).json({ error: e.message });
   } finally {
-    client.release();
+    conn.release();
   }
 });
 
@@ -258,16 +296,16 @@ app.get("/api/staged", async (req, res) => {
     const params = [];
     let where = "";
     if (cursor != null) {
-      where = dir === "DESC" ? "WHERE id < $1" : "WHERE id > $1";
+      where = dir === "DESC" ? "WHERE id < ?" : "WHERE id > ?";
       params.push(cursor);
     }
-    const rows = (await pool.query(
-      `SELECT * FROM scans ${where} ORDER BY id ${dir} LIMIT ${limit}`,
-      params
-    )).rows;
+    const [rows] = await pool.query(
+      `SELECT * FROM scans ${where} ORDER BY id ${dir} LIMIT ${limit}`, params
+    );
 
     const nextCursor = rows.length ? rows[rows.length - 1].id : null;
-    const total = Number((await pool.query(`SELECT COUNT(*) AS c FROM scans`)).rows[0].c || 0);
+    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM scans`);
+    const total = Number(c.c || 0);
 
     res.json({ rows, nextCursor, total });
   } catch (e) {
@@ -277,8 +315,8 @@ app.get("/api/staged", async (req, res) => {
 
 app.get("/api/staged/count", async (_req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT COUNT(*) AS c FROM scans`);
-    res.json({ count: Number(rows[0].c || 0) });
+    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM scans`);
+    res.json({ count: Number(c.c || 0) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -289,7 +327,7 @@ app.delete("/api/staged/:id", async (req, res) => {
   const scanId = Number(req.params.id);
   if (!scanId) return res.status(400).json({ error: "Scan ID required" });
   try {
-    const { rows } = await pool.query(`SELECT * FROM scans WHERE id=$1`, [scanId]);
+    const [rows] = await pool.query(`SELECT * FROM scans WHERE id = ?`, [scanId]);
     const row = rows[0];
     if (!row) return res.status(404).json({ error: "Scan not found" });
 
@@ -297,7 +335,7 @@ app.delete("/api/staged/:id", async (req, res) => {
       const abs = path.join(__dirname, row.qrPngPath);
       fs.existsSync(abs) && fs.unlink(abs, () => {});
     }
-    await pool.query(`DELETE FROM scans WHERE id=$1`, [scanId]);
+    await pool.query(`DELETE FROM scans WHERE id = ?`, [scanId]);
     io.emit("deleted-scan", { id: scanId });
     res.json({ ok: true });
   } catch (e) {
@@ -347,13 +385,13 @@ app.post("/api/export-to-excel", async (_req, res) => {
       "Timestamp",
     ];
 
-    const { rows } = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
+    const [rows] = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
     const dataRows = rows.map((s) => ([
       s.serial || "", s.stage || "", s.operator || "",
-      s.wagon1id || "", s.wagon2id || "", s.wagon3id || "",
-      s.receivedat || "", s.loadedat || "",
-      s.grade || "", s.railtype || "", s.spec || "", s.lengthm || "",
-      s.qrraw || "", s.qrpngpath || "",
+      s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
+      s.receivedAt || "", s.loadedAt || "",
+      s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
+      s.qrRaw || "", s.qrPngPath || "",
       s.timestamp ? new Date(s.timestamp).toISOString() : "",
     ]));
 
@@ -378,7 +416,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
   const QRCode = await getQRCode();
 
   try {
-    const { rows } = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
+    const [rows] = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
 
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Scans");
@@ -407,16 +445,16 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
         serial:     s.serial || "",
         stage:      s.stage || "",
         operator:   s.operator || "",
-        wagon1Id:   s.wagon1id || "",
-        wagon2Id:   s.wagon2id || "",
-        wagon3Id:   s.wagon3id || "",
-        receivedAt: s.receivedat || "",
-        loadedAt:   s.loadedat || "",
+        wagon1Id:   s.wagon1Id || "",
+        wagon2Id:   s.wagon2Id || "",
+        wagon3Id:   s.wagon3Id || "",
+        receivedAt: s.receivedAt || "",
+        loadedAt:   s.loadedAt || "",
         grade:      s.grade || "",
-        railType:   s.railtype || "",
+        railType:   s.railType || "",
         spec:       s.spec || "",
-        lengthM:    s.lengthm || "",
-        qrRaw:      s.qrraw || s.serial || "",
+        lengthM:    s.lengthM || "",
+        qrRaw:      s.qrRaw || s.serial || "",
         qrImage:    "",
         timestamp:  s.timestamp ? new Date(s.timestamp).toISOString() : "",
       });
@@ -428,7 +466,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
       const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage");
       const pixelSize = 90;
       for (let i = 0; i < rows.length; i++) {
-        const text = rows[i].qrraw || rows[i].serial || "";
+        const text = rows[i].qrRaw || rows[i].serial || "";
         if (!text) continue;
         const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
         const imgId = wb.addImage({ buffer: buf, extension: "png" });
@@ -453,5 +491,5 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
 // ---------- Start ----------
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, "0.0.0.0", () =>
-  console.log(`✅ Backend + Socket.IO + Postgres on :${PORT}`)
+  console.log(`✅ Backend + Socket.IO + MySQL on :${PORT}`)
 );
