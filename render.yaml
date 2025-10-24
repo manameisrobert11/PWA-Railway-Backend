@@ -12,15 +12,16 @@ services:
       name: mysql-data
       mountPath: /var/lib/mysql
       sizeGB: 10
-    # Attach the secret group you created in the UI
-    envVarGroups:
-      - rail-secrets
     envVars:
+      # Render will PROMPT you for this on first apply (don’t hardcode)
+      - key: MYSQL_ROOT_PASSWORD
+        sync: false
+      # DB name to create at init
       - key: MYSQL_DATABASE
         value: rail
 
   # ------------------------------
-  # Backend API (Node.js Web Service)
+  # Backend API (Node.js)
   # ------------------------------
   - type: web
     name: rail-backend
@@ -31,18 +32,33 @@ services:
     startCommand: node index.js
     healthCheckPath: /api/health
     autoDeploy: true
-    # Attach the same secret group so backend gets passwords
-    envVarGroups:
-      - rail-secrets
     envVars:
+      # Resolve internal host/port from the private service
       - key: MYSQL_HOST
-        value: mysql-rail
+        fromService:
+          name: mysql-rail
+          type: pserv
+          property: host
       - key: MYSQL_PORT
-        value: 3306
+        fromService:
+          name: mysql-rail
+          type: pserv
+          property: port
+
+      # Credentials (reuse the secret you entered for the DB)
       - key: MYSQL_USER
         value: root
+      - key: MYSQL_PASSWORD
+        fromService:
+          name: mysql-rail
+          type: pserv
+          envVarKey: MYSQL_ROOT_PASSWORD
+
+      # DB name
       - key: MYSQL_DATABASE
         value: rail
+
+      # App config
       - key: NODE_ENV
         value: production
       - key: CORS_ORIGIN
