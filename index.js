@@ -140,6 +140,43 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+/* ----------------------------
+   NEW: server-side duplicate check
+   ---------------------------- */
+app.get("/api/exists/:serial", async (req, res) => {
+  try {
+    const serial = String(req.params.serial || "").trim();
+    if (!serial) return res.json({ exists: false });
+
+    const [rows] = await pool.query(
+      `SELECT \`id\`, \`serial\`, \`stage\`, \`operator\`, \`timestamp\`
+         FROM \`scans\`
+        WHERE \`serial\` = ?
+        LIMIT 1`,
+      [serial]
+    );
+
+    if (rows.length) {
+      const r = rows[0];
+      return res.json({
+        exists: true,
+        row: {
+          id: r.id,
+          serial: r.serial,
+          stage: r.stage,
+          operator: r.operator,
+          timestamp: r.timestamp,
+        },
+      });
+    }
+    res.json({ exists: false });
+  } catch (e) {
+    console.error("exists check failed:", e);
+    // fail closed so scanning can still proceed
+    res.json({ exists: false, error: true });
+  }
+});
+
 // Add a new scan — ignore duplicates by serial (no-op update)
 app.post("/api/scan", async (req, res) => {
   const {
