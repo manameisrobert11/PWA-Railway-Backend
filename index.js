@@ -1,4 +1,5 @@
 // index.js — Express + MySQL + Excel export + QR images + pagination + bulk ingest
+
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -60,31 +61,44 @@ export const pool = mysql.createPool({
   queueLimit: 0,
 });
 
-// Bootstrap schema (idempotent)
+// ---------- Bootstrap schema (idempotent) — MySQL/MariaDB safe ----------
 async function bootstrapDb() {
   const conn = await pool.getConnection();
   try {
+    // Create table (defines index inline for first-time runs)
     await conn.query(`
-      CREATE TABLE IF NOT EXISTS scans (
-        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        serial      VARCHAR(191) UNIQUE,
-        stage       VARCHAR(64),
-        operator    VARCHAR(128),
-        wagon1Id    VARCHAR(128),
-        wagon2Id    VARCHAR(128),
-        wagon3Id    VARCHAR(128),
-        receivedAt  VARCHAR(64),
-        loadedAt    VARCHAR(64),
-        grade       VARCHAR(64),
-        railType    VARCHAR(64),
-        spec        VARCHAR(128),
-        lengthM     VARCHAR(32),
-        qrRaw       TEXT,
-        qrPngPath   TEXT,
-        timestamp   DATETIME
-      );
+      CREATE TABLE IF NOT EXISTS \`scans\` (
+        \`id\`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        \`serial\`      VARCHAR(191) UNIQUE,
+        \`stage\`       VARCHAR(64),
+        \`operator\`    VARCHAR(128),
+        \`wagon1Id\`    VARCHAR(128),
+        \`wagon2Id\`    VARCHAR(128),
+        \`wagon3Id\`    VARCHAR(128),
+        \`receivedAt\`  VARCHAR(64),
+        \`loadedAt\`    VARCHAR(64),
+        \`grade\`       VARCHAR(64),
+        \`railType\`    VARCHAR(64),
+        \`spec\`        VARCHAR(128),
+        \`lengthM\`     VARCHAR(32),
+        \`qrRaw\`       TEXT,
+        \`qrPngPath\`   TEXT,
+        \`timestamp\`   DATETIME,
+        INDEX \`ix_scans_timestamp\` (\`timestamp\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-    await conn.query(`CREATE INDEX IF NOT EXISTS ix_scans_timestamp ON scans (timestamp);`);
+
+    // Add index if table existed without it
+    const [rows] = await conn.query(
+      `SELECT COUNT(1) AS cnt
+         FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'scans'
+          AND index_name = 'ix_scans_timestamp'`
+    );
+    if (!rows[0]?.cnt) {
+      await conn.query(`CREATE INDEX \`ix_scans_timestamp\` ON \`scans\` (\`timestamp\`)`);
+    }
   } finally {
     conn.release();
   }
@@ -95,7 +109,7 @@ await bootstrapDb();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-io.on("connection", () => { /* socket connected */ });
+io.on("connection", () => { /* connected */ });
 
 // ---------- Helpers ----------
 async function generateQrPngAndPersist(id, text) {
@@ -105,7 +119,7 @@ async function generateQrPngAndPersist(id, text) {
     const pngPath = path.join(QR_DIR, `${id}.png`);
     const pngRel  = path.relative(__dirname, pngPath).replace(/\\/g, "/");
     await QRCode.toFile(pngPath, text, { type: "png", margin: 1, scale: 4 });
-    await pool.query(`UPDATE scans SET qrPngPath = ? WHERE id = ?`, [pngRel, id]);
+    await pool.query(`UPDATE \`scans\` SET \`qrPngPath\` = ? WHERE \`id\` = ?`, [pngRel, id]);
   } catch (e) {
     console.warn("QR PNG generation failed:", e.message);
   }
@@ -126,8 +140,7 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-// Add a new scan — MySQL upsert variant.
-// Uses ON DUPLICATE KEY UPDATE as a no-op to preserve existing row.
+// Add a new scan — ignore duplicates by serial (no-op update)
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
@@ -142,13 +155,13 @@ app.post("/api/scan", async (req, res) => {
   const ts = timestamp ? new Date(timestamp) : new Date();
   try {
     const sql = `
-      INSERT INTO scans
-        (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id,
-         receivedAt, loadedAt, grade, railType, spec, lengthM,
-         qrRaw, qrPngPath, timestamp)
+      INSERT INTO \`scans\`
+        (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
+         \`receivedAt\`, \`loadedAt\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
+         \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
-      ON DUPLICATE KEY UPDATE id = id
+      ON DUPLICATE KEY UPDATE \`id\` = \`id\`
     `;
     const vals = [
       String(serial),
@@ -168,10 +181,9 @@ app.post("/api/scan", async (req, res) => {
     ];
     const [result] = await pool.execute(sql, vals);
 
-    // If inserted, we have insertId. If duplicate, fetch existing id by serial.
     let newId = result.insertId || null;
     if (!newId) {
-      const [r2] = await pool.query(`SELECT id FROM scans WHERE serial = ? LIMIT 1`, [String(serial)]);
+      const [r2] = await pool.query(`SELECT \`id\` FROM \`scans\` WHERE \`serial\` = ? LIMIT 1`, [String(serial)]);
       newId = r2[0]?.id ?? null;
     }
 
@@ -194,7 +206,6 @@ app.post("/api/scan", async (req, res) => {
     });
 
     res.json({ ok: true, id: newId });
-
     if (newId) generateQrPngAndPersist(newId, qrRaw || serial);
   } catch (e) {
     console.error(e);
@@ -202,7 +213,7 @@ app.post("/api/scan", async (req, res) => {
   }
 });
 
-// Bulk ingest — transactional, ignore duplicates by serial.
+// Bulk ingest — transactional, ignore duplicates by serial
 app.post("/api/scans/bulk", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
@@ -213,13 +224,13 @@ app.post("/api/scans/bulk", async (req, res) => {
     await conn.beginTransaction();
 
     const text = `
-      INSERT INTO scans
-        (serial, stage, operator, wagon1Id, wagon2Id, wagon3Id,
-         receivedAt, loadedAt, grade, railType, spec, lengthM,
-         qrRaw, qrPngPath, timestamp)
+      INSERT INTO \`scans\`
+        (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
+         \`receivedAt\`, \`loadedAt\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
+         \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
-      ON DUPLICATE KEY UPDATE id = id
+      ON DUPLICATE KEY UPDATE \`id\` = \`id\`
     `;
 
     for (const r of items) {
@@ -244,7 +255,7 @@ app.post("/api/scans/bulk", async (req, res) => {
         const [result] = await conn.execute(text, vals);
         let id = result.insertId || null;
         if (!id && r.serial) {
-          const [r2] = await conn.query(`SELECT id FROM scans WHERE serial = ? LIMIT 1`, [String(r.serial)]);
+          const [r2] = await conn.query(`SELECT \`id\` FROM \`scans\` WHERE \`serial\` = ? LIMIT 1`, [String(r.serial)]);
           id = r2[0]?.id ?? null;
         }
         if (id) {
@@ -296,15 +307,15 @@ app.get("/api/staged", async (req, res) => {
     const params = [];
     let where = "";
     if (cursor != null) {
-      where = dir === "DESC" ? "WHERE id < ?" : "WHERE id > ?";
+      where = dir === "DESC" ? "WHERE \`id\` < ?" : "WHERE \`id\` > ?";
       params.push(cursor);
     }
     const [rows] = await pool.query(
-      `SELECT * FROM scans ${where} ORDER BY id ${dir} LIMIT ${limit}`, params
+      `SELECT * FROM \`scans\` ${where} ORDER BY \`id\` ${dir} LIMIT ${limit}`, params
     );
 
     const nextCursor = rows.length ? rows[rows.length - 1].id : null;
-    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM scans`);
+    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM \`scans\``);
     const total = Number(c.c || 0);
 
     res.json({ rows, nextCursor, total });
@@ -315,7 +326,7 @@ app.get("/api/staged", async (req, res) => {
 
 app.get("/api/staged/count", async (_req, res) => {
   try {
-    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM scans`);
+    const [[c]] = await pool.query(`SELECT COUNT(*) AS c FROM \`scans\``);
     res.json({ count: Number(c.c || 0) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -327,7 +338,7 @@ app.delete("/api/staged/:id", async (req, res) => {
   const scanId = Number(req.params.id);
   if (!scanId) return res.status(400).json({ error: "Scan ID required" });
   try {
-    const [rows] = await pool.query(`SELECT * FROM scans WHERE id = ?`, [scanId]);
+    const [rows] = await pool.query(`SELECT * FROM \`scans\` WHERE \`id\` = ?`, [scanId]);
     const row = rows[0];
     if (!row) return res.status(404).json({ error: "Scan not found" });
 
@@ -335,7 +346,7 @@ app.delete("/api/staged/:id", async (req, res) => {
       const abs = path.join(__dirname, row.qrPngPath);
       fs.existsSync(abs) && fs.unlink(abs, () => {});
     }
-    await pool.query(`DELETE FROM scans WHERE id = ?`, [scanId]);
+    await pool.query(`DELETE FROM \`scans\` WHERE \`id\` = ?`, [scanId]);
     io.emit("deleted-scan", { id: scanId });
     res.json({ ok: true });
   } catch (e) {
@@ -352,7 +363,7 @@ app.post("/api/staged/clear", async (_req, res) => {
         try { fs.unlinkSync(p); } catch {}
       }
     }
-    await pool.query(`DELETE FROM scans`);
+    await pool.query(`DELETE FROM \`scans\``);
     io.emit("cleared-scans");
     res.json({ ok: true });
   } catch (e) {
@@ -385,7 +396,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
       "Timestamp",
     ];
 
-    const [rows] = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
+    const [rows] = await pool.query(`SELECT * FROM \`scans\` ORDER BY \`id\` ASC`);
     const dataRows = rows.map((s) => ([
       s.serial || "", s.stage || "", s.operator || "",
       s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
@@ -416,7 +427,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
   const QRCode = await getQRCode();
 
   try {
-    const [rows] = await pool.query(`SELECT * FROM scans ORDER BY id ASC`);
+    const [rows] = await pool.query(`SELECT * FROM \`scans\` ORDER BY \`id\` ASC`);
 
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Scans");
