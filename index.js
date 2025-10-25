@@ -10,6 +10,9 @@ import http from "http";
 import { Server } from "socket.io";
 import mysql from "mysql2/promise";
 
+// ----- BOOT TAG (change this string each deploy to prove new code is running)
+console.log("BOOT TAG:", "2025-10-25-01");
+
 // ---------- Lazy loaders (optional dependencies) ----------
 async function getExcelJS() {
   try { const m = await import("exceljs"); return m.default || m; } catch { return null; }
@@ -29,6 +32,14 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const QR_DIR = path.join(UPLOAD_DIR, "qrcodes");
 if (!fs.existsSync(QR_DIR)) fs.mkdirSync(QR_DIR, { recursive: true });
 const upload = multer({ dest: UPLOAD_DIR });
+
+// ---------- TEMP OVERRIDE (remove after things are stable)
+// If neither MYSQL_URL nor MYSQL_HOST is present, force a known-good URL.
+if (!process.env.MYSQL_URL && !process.env.MYSQL_HOST) {
+  // ⚠️ UPDATE THE HOST if your MySQL service name differs
+  process.env.MYSQL_URL = "mysql://railuser:Test1234!@mysql-1ec8:3306/rail";
+  console.log("[TEMP OVERRIDE] Set MYSQL_URL to mysql-1ec8 for this boot.");
+}
 
 // ---------- MySQL pool ----------
 function cfgFromUrl(url) {
@@ -53,6 +64,30 @@ const baseConfig = process.env.MYSQL_URL
       database: process.env.MYSQL_DATABASE,
       ssl: process.env.MYSQL_SSL === "true" ? { rejectUnauthorized: false } : undefined,
     };
+
+// ----- DEBUG: print env + the DB config we will actually use
+console.log("[ENV SNAPSHOT]", {
+  MYSQL_URL: process.env.MYSQL_URL || null,
+  MYSQL_HOST: process.env.MYSQL_HOST || null,
+  MYSQL_PORT: process.env.MYSQL_PORT || null,
+  MYSQL_DATABASE: process.env.MYSQL_DATABASE || null,
+  MYSQL_USER: process.env.MYSQL_USER || null,
+  MYSQL_SSL: process.env.MYSQL_SSL || null,
+  NODE_VERSION: process.env.NODE_VERSION || null,
+});
+
+console.log("[DB CONFIG about to use]", {
+  host: baseConfig.host,
+  port: baseConfig.port,
+  user: baseConfig.user,
+  db: baseConfig.database,
+  ssl: !!baseConfig.ssl,
+});
+
+// Hard-fail if we’d connect to localhost (prevents silent fallback)
+if (!baseConfig.host || baseConfig.host === "localhost" || baseConfig.host === "127.0.0.1") {
+  throw new Error("DB host resolved to localhost/empty. Set MYSQL_URL or MYSQL_HOST to your Render MySQL hostname (e.g., mysql-1ec8).");
+}
 
 export const pool = mysql.createPool({
   ...baseConfig,
@@ -88,7 +123,7 @@ async function bootstrapDb() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Add index if table existed without it
+    // Add index if table existed without it (defensive)
     const [rows] = await conn.query(
       `SELECT COUNT(1) AS cnt
          FROM information_schema.statistics
@@ -103,6 +138,23 @@ async function bootstrapDb() {
     conn.release();
   }
 }
+
+// wait for DB reachable with a few retries (useful on cold starts)
+async function waitForDb(retries = 12) {
+  for (let i = 1; i <= retries; i++) {
+    try {
+      await pool.query("SELECT 1");
+      console.log("DB reachable");
+      return;
+    } catch (e) {
+      console.log(`DB not ready (attempt ${i}/${retries})`, e.code || e.message);
+      await new Promise((r) => setTimeout(r, i * 1000));
+    }
+  }
+  throw new Error("DB not reachable after retries");
+}
+
+await waitForDb();
 await bootstrapDb();
 
 // ---------- HTTP + Socket.IO ----------
@@ -137,43 +189,6 @@ app.get("/api/health", async (_req, res) => {
     res.json({ ok: true, db: true });
   } catch {
     res.status(500).json({ ok: false, db: false });
-  }
-});
-
-/* ----------------------------
-   NEW: server-side duplicate check
-   ---------------------------- */
-app.get("/api/exists/:serial", async (req, res) => {
-  try {
-    const serial = String(req.params.serial || "").trim();
-    if (!serial) return res.json({ exists: false });
-
-    const [rows] = await pool.query(
-      `SELECT \`id\`, \`serial\`, \`stage\`, \`operator\`, \`timestamp\`
-         FROM \`scans\`
-        WHERE \`serial\` = ?
-        LIMIT 1`,
-      [serial]
-    );
-
-    if (rows.length) {
-      const r = rows[0];
-      return res.json({
-        exists: true,
-        row: {
-          id: r.id,
-          serial: r.serial,
-          stage: r.stage,
-          operator: r.operator,
-          timestamp: r.timestamp,
-        },
-      });
-    }
-    res.json({ exists: false });
-  } catch (e) {
-    console.error("exists check failed:", e);
-    // fail closed so scanning can still proceed
-    res.json({ exists: false, error: true });
   }
 });
 
@@ -314,7 +329,7 @@ app.post("/api/scans/bulk", async (req, res) => {
             qrRaw: r.qrRaw || "",
             timestamp: (r.timestamp ? new Date(r.timestamp) : new Date()).toISOString(),
           });
-          generateQrPngAndPersist(id, r.qrRaw || r.serial || "").catch(()=>{});
+          generateQrPngAndPersist(id, r.qrRaw || r.serial || "").catch(() => {});
         } else {
           skipped++;
         }
