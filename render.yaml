@@ -1,28 +1,4 @@
 services:
-  # ------------------------------
-  # MySQL (Private Service)
-  # ------------------------------
-  - type: pserv
-    name: mysql-rail
-    runtime: docker
-    plan: starter
-    region: oregon
-    dockerfilePath: ./mysql/Dockerfile
-    disk:
-      name: mysql-data
-      mountPath: /var/lib/mysql
-      sizeGB: 10
-    envVars:
-      # Render will PROMPT you for this on first apply (don’t hardcode)
-      - key: MYSQL_ROOT_PASSWORD
-        sync: false
-      # DB name to create at init
-      - key: MYSQL_DATABASE
-        value: rail
-
-  # ------------------------------
-  # Backend API (Node.js)
-  # ------------------------------
   - type: web
     name: rail-backend
     runtime: node
@@ -33,33 +9,9 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      # Resolve internal host/port from the private service
-      - key: MYSQL_HOST
-        fromService:
-          name: mysql-rail
-          type: pserv
-          property: host
-      - key: MYSQL_PORT
-        fromService:
-          name: mysql-rail
-          type: pserv
-          property: port
-
-      # Credentials (reuse the secret you entered for the DB)
-      - key: MYSQL_USER
-        value: root
-      - key: MYSQL_PASSWORD
-        fromService:
-          name: mysql-rail
-          type: pserv
-          envVarKey: MYSQL_ROOT_PASSWORD
-
-      # DB name
-      - key: MYSQL_DATABASE
-        value: rail
-
-      # App config
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 20.17.0
       - key: CORS_ORIGIN
         value: "*"
