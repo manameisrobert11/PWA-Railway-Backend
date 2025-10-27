@@ -1,11 +1,12 @@
 {
   "name": "rail-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "dev": "cross-env NODE_ENV=development PORT=4000 node index.js",
+    "start:debug": "cross-env NODE_ENV=production NODE_OPTIONS='--trace-warnings' node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -17,8 +18,11 @@
     "socket.io": "^4.7.5",
     "xlsx": "^0.18.5"
   },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
+  },
   "engines": {
-    "node": ">=18.18"
-  }
+    "node": "20.x"
+  },
+  "license": "UNLICENSED"
 }
-
