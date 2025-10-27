@@ -107,7 +107,7 @@ if (!baseConfig.host || baseConfig.host === "localhost" || baseConfig.host === "
 
 export const pool = mysql.createPool({
   ...baseConfig,
-  connectionLimit: 10,
+  connectionLimit: 30,            // bumped for more concurrent writers
   waitForConnections: true,
   queueLimit: 0,
 });
@@ -229,7 +229,7 @@ app.get("/socket-test", (_req, res) => {
   res.type("text/plain").send("OK");
 });
 
-// Add a new scan — ignore duplicates by serial (no-op update)
+// Add a new scan — UPSERT by `serial` (idempotent; last write wins)
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
@@ -250,7 +250,20 @@ app.post("/api/scan", async (req, res) => {
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
-      ON DUPLICATE KEY UPDATE \`id\` = \`id\`
+      ON DUPLICATE KEY UPDATE
+        \`stage\`      = VALUES(\`stage\`),
+        \`operator\`   = VALUES(\`operator\`),
+        \`wagon1Id\`   = VALUES(\`wagon1Id\`),
+        \`wagon2Id\`   = VALUES(\`wagon2Id\`),
+        \`wagon3Id\`   = VALUES(\`wagon3Id\`),
+        \`receivedAt\` = VALUES(\`receivedAt\`),
+        \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`grade\`      = VALUES(\`grade\`),
+        \`railType\`   = VALUES(\`railType\`),
+        \`spec\`       = VALUES(\`spec\`),
+        \`lengthM\`    = VALUES(\`lengthM\`),
+        \`qrRaw\`      = VALUES(\`qrRaw\`),
+        \`timestamp\`  = VALUES(\`timestamp\`)
     `;
     const vals = [
       String(serial),
@@ -304,7 +317,7 @@ app.post("/api/scan", async (req, res) => {
   }
 });
 
-// Bulk ingest — transactional, ignore duplicates by serial
+// Bulk ingest — UPSERT by `serial` (transactional; last write wins)
 app.post("/api/scans/bulk", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
@@ -321,7 +334,20 @@ app.post("/api/scans/bulk", async (req, res) => {
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
-      ON DUPLICATE KEY UPDATE \`id\` = \`id\`
+      ON DUPLICATE KEY UPDATE
+        \`stage\`      = VALUES(\`stage\`),
+        \`operator\`   = VALUES(\`operator\`),
+        \`wagon1Id\`   = VALUES(\`wagon1Id\`),
+        \`wagon2Id\`   = VALUES(\`wagon2Id\`),
+        \`wagon3Id\`   = VALUES(\`wagon3Id\`),
+        \`receivedAt\` = VALUES(\`receivedAt\`),
+        \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`grade\`      = VALUES(\`grade\`),
+        \`railType\`   = VALUES(\`railType\`),
+        \`spec\`       = VALUES(\`spec\`),
+        \`lengthM\`    = VALUES(\`lengthM\`),
+        \`qrRaw\`      = VALUES(\`qrRaw\`),
+        \`timestamp\`  = VALUES(\`timestamp\`)
     `;
 
     for (const r of items) {
