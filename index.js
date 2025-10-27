@@ -1,4 +1,4 @@
-// index.js — Express + MySQL + Excel export + QR images + pagination + bulk ingest
+// index.js — Express + MySQL + Excel export + QR images + pagination + bulk ingest + Socket.IO
 
 import express from "express";
 import cors from "cors";
@@ -11,7 +11,7 @@ import { Server } from "socket.io";
 import mysql from "mysql2/promise";
 
 // ----- BOOT TAG (change this string each deploy to prove new code is running)
-console.log("BOOT TAG:", "2025-10-25-01");
+console.log("BOOT TAG:", "2025-10-27-rail-v2");
 
 // ---------- Lazy loaders (optional dependencies) ----------
 async function getExcelJS() {
@@ -24,7 +24,23 @@ async function getQRCode() {
 // ---------- App + paths ----------
 const __dirname = process.cwd();
 const app = express();
-app.use(cors());
+
+// ---- Allowed origins (Netlify + local dev) ----
+const ALLOWED_ORIGINS = [
+  "https://pwarailway.netlify.app",
+  process.env.LOCAL_ORIGIN || "http://localhost:5173",
+];
+
+// ---- CORS for REST ----
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow non-browser tools (no origin) and whitelisted origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  methods: ["GET","POST","DELETE","PUT","OPTIONS"],
+  credentials: true,
+}));
 app.use(express.json({ limit: "256kb" }));
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
@@ -100,7 +116,6 @@ export const pool = mysql.createPool({
 async function bootstrapDb() {
   const conn = await pool.getConnection();
   try {
-    // Create table (defines index inline for first-time runs)
     await conn.query(`
       CREATE TABLE IF NOT EXISTS \`scans\` (
         \`id\`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -123,7 +138,6 @@ async function bootstrapDb() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Add index if table existed without it (defensive)
     const [rows] = await conn.query(
       `SELECT COUNT(1) AS cnt
          FROM information_schema.statistics
@@ -159,9 +173,27 @@ await bootstrapDb();
 
 // ---------- HTTP + Socket.IO ----------
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-io.on("connection", () => { /* connected */ });
+const io = new Server(server, {
+  path: "/socket.io",
+  transports: ["websocket", "polling"],
+  cors: {
+    origin: (origin, cb) => {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`Socket CORS blocked for origin: ${origin}`));
+    },
+    methods: ["GET","POST"],
+    credentials: true,
+  },
+});
+
+// Simple connection logging + heartbeat
+io.on("connection", (socket) => {
+  console.log("socket connected:", socket.id, "from", socket.handshake.headers.origin || "unknown");
+  socket.on("disconnect", (reason) => {
+    console.log("socket disconnected:", socket.id, reason);
+  });
+});
 
 // ---------- Helpers ----------
 async function generateQrPngAndPersist(id, text) {
@@ -179,9 +211,10 @@ async function generateQrPngAndPersist(id, text) {
 
 // ---------- API Routes ----------
 
-// Version + health
+// Version + health + socket test
+app.get("/", (_req, res) => res.send("Rail backend is running."));
 app.get("/api/version", (_req, res) => {
-  res.json({ ok: true, version: "mysql-v1" });
+  res.json({ ok: true, version: "mysql-v2", bootTag: "2025-10-27-rail-v2" });
 });
 app.get("/api/health", async (_req, res) => {
   try {
@@ -190,6 +223,10 @@ app.get("/api/health", async (_req, res) => {
   } catch {
     res.status(500).json({ ok: false, db: false });
   }
+});
+// Quick Engine.IO check endpoint (useful in browser)
+app.get("/socket-test", (_req, res) => {
+  res.type("text/plain").send("OK");
 });
 
 // Add a new scan — ignore duplicates by serial (no-op update)
@@ -239,7 +276,7 @@ app.post("/api/scan", async (req, res) => {
       newId = r2[0]?.id ?? null;
     }
 
-    io.emit("new-scan", {
+    const payload = {
       id: newId,
       serial: String(serial),
       stage: stage || "received",
@@ -255,7 +292,9 @@ app.post("/api/scan", async (req, res) => {
       lengthM: lengthM || "",
       qrRaw: qrRaw || "",
       timestamp: ts.toISOString(),
-    });
+    };
+
+    io.emit("new-scan", payload);
 
     res.json({ ok: true, id: newId });
     if (newId) generateQrPngAndPersist(newId, qrRaw || serial);
