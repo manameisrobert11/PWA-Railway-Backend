@@ -94,7 +94,7 @@ console.log("[ENV SNAPSHOT]", {
   MYSQL_HOST: process.env.MYSQL_HOST || null,
   MYSQL_PORT: process.env.MYSQL_PORT || null,
   MYSQL_DATABASE: process.env.MYSQL_DATABASE || null,
-  MYSQL_USER: process.env.MYSQL_USER || null,
+  MYSQL_USER: process.env.MYSQL_USER,
   MYSQL_SSL: process.env.MYSQL_SSL || null,
   NODE_VERSION: process.env.NODE_VERSION || null,
 });
@@ -123,7 +123,7 @@ export const pool = mysql.createPool({
 async function bootstrapDb() {
   const conn = await pool.getConnection();
   try {
-    // MAIN table
+    // MAIN table (now includes destination)
     await conn.query(`
       CREATE TABLE IF NOT EXISTS \`scans\` (
         \`id\`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -135,6 +135,7 @@ async function bootstrapDb() {
         \`wagon3Id\`    VARCHAR(128),
         \`receivedAt\`  VARCHAR(64),
         \`loadedAt\`    VARCHAR(64),
+        \`destination\` VARCHAR(128),
         \`grade\`       VARCHAR(64),
         \`railType\`    VARCHAR(64),
         \`spec\`        VARCHAR(128),
@@ -146,7 +147,7 @@ async function bootstrapDb() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // ensure index exists
+    // ensure index exists for MAIN
     const [rowsIdx] = await conn.query(
       `SELECT COUNT(1) AS cnt
          FROM information_schema.statistics
@@ -158,7 +159,7 @@ async function bootstrapDb() {
       await conn.query(`CREATE INDEX \`ix_scans_timestamp\` ON \`scans\` (\`timestamp\`)`);
     }
 
-    // ALT table mirrors main
+    // ALT table mirrors main (includes destination)
     await conn.query(`
       CREATE TABLE IF NOT EXISTS \`scans_alt\` (
         \`id\`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -170,6 +171,7 @@ async function bootstrapDb() {
         \`wagon3Id\`    VARCHAR(128),
         \`receivedAt\`  VARCHAR(64),
         \`loadedAt\`    VARCHAR(64),
+        \`destination\` VARCHAR(128),
         \`grade\`       VARCHAR(64),
         \`railType\`    VARCHAR(64),
         \`spec\`        VARCHAR(128),
@@ -180,6 +182,19 @@ async function bootstrapDb() {
         INDEX \`ix_scans_alt_timestamp\` (\`timestamp\`)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // ensure index exists for ALT
+    const [rowsIdxAlt] = await conn.query(
+      `SELECT COUNT(1) AS cnt
+         FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'scans_alt'
+          AND index_name = 'ix_scans_alt_timestamp'`
+    );
+    if (!rowsIdxAlt[0]?.cnt) {
+      await conn.query(`CREATE INDEX \`ix_scans_alt_timestamp\` ON \`scans_alt\` (\`timestamp\`)`);
+    }
+
   } finally {
     conn.release();
   }
@@ -264,11 +279,12 @@ app.get("/socket-test", (_req, res) => {
 // ---------- MAIN PIPELINE ----------
 
 // Add a new scan — UPSERT by `serial` (idempotent; last write wins)
+// now accepts destination
 app.post("/api/scan", async (req, res) => {
   const {
     serial, stage, operator,
     wagon1Id, wagon2Id, wagon3Id,
-    receivedAt, loadedAt,
+    receivedAt, loadedAt, destination,
     grade, railType, spec, lengthM,
     qrRaw, timestamp,
   } = req.body;
@@ -280,7 +296,7 @@ app.post("/api/scan", async (req, res) => {
     const sql = `
       INSERT INTO \`scans\`
         (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
-         \`receivedAt\`, \`loadedAt\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
+         \`receivedAt\`, \`loadedAt\`, \`destination\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
@@ -292,6 +308,7 @@ app.post("/api/scan", async (req, res) => {
         \`wagon3Id\`   = VALUES(\`wagon3Id\`),
         \`receivedAt\` = VALUES(\`receivedAt\`),
         \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`destination\`= VALUES(\`destination\`),
         \`grade\`      = VALUES(\`grade\`),
         \`railType\`   = VALUES(\`railType\`),
         \`spec\`       = VALUES(\`spec\`),
@@ -308,6 +325,7 @@ app.post("/api/scan", async (req, res) => {
       wagon3Id || "",
       receivedAt || "",
       loadedAt || "",
+      destination || "",
       grade || "",
       railType || "",
       spec || "",
@@ -333,6 +351,7 @@ app.post("/api/scan", async (req, res) => {
       wagon3Id: wagon3Id || "",
       receivedAt: receivedAt || "",
       loadedAt: loadedAt || "",
+      destination: destination || "",
       grade: grade || "",
       railType: railType || "",
       spec: spec || "",
@@ -350,7 +369,7 @@ app.post("/api/scan", async (req, res) => {
   }
 });
 
-// Bulk ingest — UPSERT by `serial`
+// Bulk ingest — UPSERT by `serial` (MAIN) — includes destination
 app.post("/api/scans/bulk", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
@@ -363,7 +382,7 @@ app.post("/api/scans/bulk", async (req, res) => {
     const text = `
       INSERT INTO \`scans\`
         (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
-         \`receivedAt\`, \`loadedAt\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
+         \`receivedAt\`, \`loadedAt\`, \`destination\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
@@ -375,6 +394,7 @@ app.post("/api/scans/bulk", async (req, res) => {
         \`wagon3Id\`   = VALUES(\`wagon3Id\`),
         \`receivedAt\` = VALUES(\`receivedAt\`),
         \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`destination\`= VALUES(\`destination\`),
         \`grade\`      = VALUES(\`grade\`),
         \`railType\`   = VALUES(\`railType\`),
         \`spec\`       = VALUES(\`spec\`),
@@ -393,6 +413,7 @@ app.post("/api/scans/bulk", async (req, res) => {
         r.wagon3Id || "",
         r.receivedAt || "",
         r.loadedAt || "",
+        r.destination || "",
         r.grade || "",
         r.railType || "",
         r.spec || "",
@@ -420,6 +441,7 @@ app.post("/api/scans/bulk", async (req, res) => {
             wagon3Id: r.wagon3Id || "",
             receivedAt: r.receivedAt || "",
             loadedAt: r.loadedAt || "",
+            destination: r.destination || "",
             grade: r.grade || "",
             railType: r.railType || "",
             spec: r.spec || "",
@@ -517,7 +539,7 @@ app.delete("/api/staged/:id", async (req, res) => {
   }
 });
 
-// Clear all scans
+// Clear all scans (MAIN)
 app.post("/api/staged/clear", async (_req, res) => {
   try {
     if (fs.existsSync(QR_DIR)) {
@@ -539,7 +561,7 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
   res.json({ ok: true, path: req.file?.path });
 });
 
-// Export to .xlsm (macro-enabled) — MAIN
+// Export to .xlsm (macro-enabled) — MAIN (includes Destination)
 app.post("/api/export-to-excel", async (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -553,7 +575,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
     const HEADERS = [
       "Serial","Stage","Operator",
       "Wagon1ID","Wagon2ID","Wagon3ID",
-      "RecievedAt","LoadedAt",
+      "RecievedAt","LoadedAt","Destination",
       "Grade","RailType","Spec","Length",
       "QRText","QRImagePath",
       "Timestamp",
@@ -563,7 +585,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
     const dataRows = rows.map((s) => ([
       s.serial || "", s.stage || "", s.operator || "",
       s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
-      s.receivedAt || "", s.loadedAt || "",
+      s.receivedAt || "", s.loadedAt || "", s.destination || "",
       s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
       s.qrRaw || "", s.qrPngPath || "",
       s.timestamp ? new Date(s.timestamp).toISOString() : "",
@@ -583,7 +605,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
   }
 });
 
-// Export to .xlsx with embedded QR images (no template) — MAIN
+// Export to .xlsx with embedded QR images (no template) — MAIN (includes Destination)
 app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) return res.status(400).json({ error: "exceljs not installed. Run: npm i exceljs qrcode" });
@@ -604,6 +626,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
       { header: "Wagon3ID",    key: "wagon3Id",    width: 14 },
       { header: "RecievedAt",  key: "receivedAt",  width: 18 },
       { header: "LoadedAt",    key: "loadedAt",    width: 18 },
+      { header: "Destination", key: "destination", width: 20 },
       { header: "Grade",       key: "grade",       width: 12 },
       { header: "RailType",    key: "railType",    width: 12 },
       { header: "Spec",        key: "spec",        width: 18 },
@@ -624,6 +647,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
         wagon3Id:   s.wagon3Id || "",
         receivedAt: s.receivedAt || "",
         loadedAt:   s.loadedAt || "",
+        destination:s.destination || "",
         grade:      s.grade || "",
         railType:   s.railType || "",
         spec:       s.spec || "",
@@ -664,12 +688,12 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
 
 // ---------- ALT PIPELINE (separate table: scans_alt) ----------
 
-// Add a new scan — UPSERT by `serial` (ALT)
+// Add a new scan — UPSERT by `serial` (ALT) — now accepts destination
 app.post("/api/scan-alt", async (req, res) => {
   const {
     serial, stage, operator,
     wagon1Id, wagon2Id, wagon3Id,
-    receivedAt, loadedAt,
+    receivedAt, loadedAt, destination,
     grade, railType, spec, lengthM,
     qrRaw, timestamp,
   } = req.body;
@@ -681,7 +705,7 @@ app.post("/api/scan-alt", async (req, res) => {
     const sql = `
       INSERT INTO \`scans_alt\`
         (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
-         \`receivedAt\`, \`loadedAt\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
+         \`receivedAt\`, \`loadedAt\`, \`destination\`, \`grade\`, \`railType\`, \`spec\`, \`lengthM\`,
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
@@ -693,6 +717,7 @@ app.post("/api/scan-alt", async (req, res) => {
         \`wagon3Id\`   = VALUES(\`wagon3Id\`),
         \`receivedAt\` = VALUES(\`receivedAt\`),
         \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`destination\`= VALUES(\`destination\`),
         \`grade\`      = VALUES(\`grade\`),
         \`railType\`   = VALUES(\`railType\`),
         \`spec\`       = VALUES(\`spec\`),
@@ -709,6 +734,7 @@ app.post("/api/scan-alt", async (req, res) => {
       wagon3Id || "",
       receivedAt || "",
       loadedAt || "",
+      destination || "",
       grade || "",
       railType || "",
       spec || "",
@@ -734,6 +760,7 @@ app.post("/api/scan-alt", async (req, res) => {
       wagon3Id: wagon3Id || "",
       receivedAt: receivedAt || "",
       loadedAt: loadedAt || "",
+      destination: destination || "",
       grade: grade || "",
       railType: railType || "",
       spec: spec || "",
@@ -751,7 +778,7 @@ app.post("/api/scan-alt", async (req, res) => {
   }
 });
 
-// Bulk ingest — ALT
+// Bulk ingest — ALT (includes destination)
 app.post("/api/scans-alt/bulk", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) return res.json({ ok: true, inserted: 0, skipped: 0 });
@@ -764,7 +791,7 @@ app.post("/api/scans-alt/bulk", async (req, res) => {
     const text = `
       INSERT INTO \`scans_alt\`
         (\`serial\`, \`stage\`, \`operator\`, \`wagon1Id\`, \`wagon2Id\`, \`wagon3Id\`,
-         \`receivedAt\`, \`loadedAt\`, \`grade\` ,\`railType\`, \`spec\`, \`lengthM\`,
+         \`receivedAt\`, \`loadedAt\`, \`destination\`, \`grade\` ,\`railType\`, \`spec\`, \`lengthM\`,
          \`qrRaw\`, \`qrPngPath\`, \`timestamp\`)
       VALUES
         (?,?,?,?,?,?,?,?,?,?,?,?,?,'',?)
@@ -776,6 +803,7 @@ app.post("/api/scans-alt/bulk", async (req, res) => {
         \`wagon3Id\`   = VALUES(\`wagon3Id\`),
         \`receivedAt\` = VALUES(\`receivedAt\`),
         \`loadedAt\`   = VALUES(\`loadedAt\`),
+        \`destination\`= VALUES(\`destination\`),
         \`grade\`      = VALUES(\`grade\`),
         \`railType\`   = VALUES(\`railType\`),
         \`spec\`       = VALUES(\`spec\`),
@@ -794,6 +822,7 @@ app.post("/api/scans-alt/bulk", async (req, res) => {
         r.wagon3Id || "",
         r.receivedAt || "",
         r.loadedAt || "",
+        r.destination || "",
         r.grade || "",
         r.railType || "",
         r.spec || "",
@@ -821,6 +850,7 @@ app.post("/api/scans-alt/bulk", async (req, res) => {
             wagon3Id: r.wagon3Id || "",
             receivedAt: r.receivedAt || "",
             loadedAt: r.loadedAt || "",
+            destination: r.destination || "",
             grade: r.grade || "",
             railType: r.railType || "",
             spec: r.spec || "",
@@ -935,7 +965,7 @@ app.post("/api/staged-alt/clear", async (_req, res) => {
   }
 });
 
-// Export to .xlsm (macro-enabled) — ALT (uses uploads/template_alt.xlsm)
+// Export to .xlsm (macro-enabled) — ALT (uses uploads/template_alt.xlsm) — includes Destination
 app.post("/api/export-alt-to-excel", async (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template_alt.xlsm");
@@ -949,7 +979,7 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
     const HEADERS = [
       "Serial","Stage","Operator",
       "Wagon1ID","Wagon2ID","Wagon3ID",
-      "RecievedAt","LoadedAt",
+      "RecievedAt","LoadedAt","Destination",
       "Grade","RailType","Spec","Length",
       "QRText","QRImagePath",
       "Timestamp",
@@ -959,7 +989,7 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
     const dataRows = rows.map((s) => ([
       s.serial || "", s.stage || "", s.operator || "",
       s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
-      s.receivedAt || "", s.loadedAt || "",
+      s.receivedAt || "", s.loadedAt || "", s.destination || "",
       s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
       s.qrRaw || "", s.qrPngPath || "",
       s.timestamp ? new Date(s.timestamp).toISOString() : "",
@@ -979,7 +1009,7 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
   }
 });
 
-// Export to .xlsx with embedded QR images — ALT
+// Export to .xlsx with embedded QR images — ALT (includes Destination)
 app.all("/api/export-alt-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) return res.status(400).json({ error: "exceljs not installed. Run: npm i exceljs qrcode" });
@@ -1000,6 +1030,7 @@ app.all("/api/export-alt-xlsx-images", async (_req, res) => {
       { header: "Wagon3ID",    key: "wagon3Id",    width: 14 },
       { header: "RecievedAt",  key: "receivedAt",  width: 18 },
       { header: "LoadedAt",    key: "loadedAt",    width: 18 },
+      { header: "Destination", key: "destination", width: 20 },
       { header: "Grade",       key: "grade",       width: 12 },
       { header: "RailType",    key: "railType",    width: 12 },
       { header: "Spec",        key: "spec",        width: 18 },
@@ -1020,6 +1051,7 @@ app.all("/api/export-alt-xlsx-images", async (_req, res) => {
         wagon3Id:   s.wagon3Id || "",
         receivedAt: s.receivedAt || "",
         loadedAt:   s.loadedAt || "",
+        destination:s.destination || "",
         grade:      s.grade || "",
         railType:   s.railType || "",
         spec:       s.spec || "",
