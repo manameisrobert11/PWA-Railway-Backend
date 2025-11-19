@@ -540,18 +540,21 @@ app.delete("/api/staged/:id", async (req, res) => {
 });
 
 // Clear all scans (MAIN)
-app.post("/api/staged/clear", async (_req, res) => {
+// Added diagnostic logs for tracing who triggered the clear
+app.post("/api/staged/clear", async (req, res) => {
   try {
+    console.log("[CLEAR] /api/staged/clear called - ip:", req.ip, "ua:", req.headers["user-agent"]);
     if (fs.existsSync(QR_DIR)) {
       for (const f of fs.readdirSync(QR_DIR)) {
         const p = path.join(QR_DIR, f);
-        try { fs.unlinkSync(p); } catch {}
+        try { fs.unlinkSync(p); } catch (err) { console.warn("Failed to unlink QR file:", p, err && err.message); }
       }
     }
     await pool.query(`DELETE FROM \`scans\``);
     io.emit("cleared-scans");
     res.json({ ok: true });
   } catch (e) {
+    console.error("[CLEAR] error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -562,6 +565,7 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
 });
 
 // Export to .xlsm (macro-enabled) — MAIN (includes Destination)
+// Replaced with safer write-to-buffer and logging
 app.post("/api/export-to-excel", async (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
@@ -569,8 +573,10 @@ app.post("/api/export-to-excel", async (_req, res) => {
       return res.status(400).json({ error: "template.xlsm not found" });
     }
 
+    // Read template (keep bookVBA true)
     const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
-    const sheetName = wb.SheetNames[0];
+    const sheetName = wb.SheetNames[0] || "Sheet1";
+    console.log("[EXPORT-XLSM] using template sheet:", sheetName);
 
     const HEADERS = [
       "Serial","Stage","Operator",
@@ -582,6 +588,8 @@ app.post("/api/export-to-excel", async (_req, res) => {
     ];
 
     const [rows] = await pool.query(`SELECT * FROM \`scans\` ORDER BY \`id\` ASC`);
+    console.log("[EXPORT-XLSM] rows fetched:", rows.length);
+
     const dataRows = rows.map((s) => ([
       s.serial || "", s.stage || "", s.operator || "",
       s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
@@ -593,12 +601,23 @@ app.post("/api/export-to-excel", async (_req, res) => {
 
     const aoa = [HEADERS, ...dataRows];
     const newWs = XLSX.utils.aoa_to_sheet(aoa);
-    wb.Sheets[sheetName] = newWs;
 
+    // Replace sheet contents (ensure the sheet name is present in the sheet list)
+    wb.Sheets[sheetName] = newWs;
+    if (!wb.SheetNames.includes(sheetName)) wb.SheetNames = [sheetName, ...wb.SheetNames];
+
+    // Write to a buffer (safer) and then save/send
+    const outBuffer = XLSX.write(wb, { bookType: "xlsm", bookVBA: true, type: "buffer" });
     const outName = `Master_${Date.now()}.xlsm`;
     const outPath = path.join(UPLOAD_DIR, outName);
-    XLSX.writeFile(wb, outPath, { bookType: "xlsm", bookVBA: true });
-    res.download(outPath, outName);
+    fs.writeFileSync(outPath, outBuffer);
+
+    console.log("[EXPORT-XLSM] wrote file:", outPath, "size:", fs.statSync(outPath).size);
+    res.download(outPath, outName, (err) => {
+      if (err) console.error("[EXPORT-XLSM] download error:", err);
+      // optionally remove file after download:
+      // try { fs.unlinkSync(outPath); } catch (e) {}
+    });
   } catch (err) {
     console.error("Export failed:", err);
     res.status(500).json({ error: err.message });
@@ -606,6 +625,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
 });
 
 // Export to .xlsx with embedded QR images (no template) — MAIN (includes Destination)
+// Replaced with cell-range anchored images and logging
 app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) return res.status(400).json({ error: "exceljs not installed. Run: npm i exceljs qrcode" });
@@ -613,6 +633,7 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
 
   try {
     const [rows] = await pool.query(`SELECT * FROM \`scans\` ORDER BY \`id\` ASC`);
+    console.log("[EXPORT-XLSX-IMG] rows:", rows.length);
 
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Scans");
@@ -657,22 +678,42 @@ app.all("/api/export-xlsx-images", async (_req, res) => {
         timestamp:  s.timestamp ? new Date(s.timestamp).toISOString() : "",
       });
     });
+
     ws.getRow(1).font = { bold: true };
     for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
 
     if (QRCode) {
+      // helper: convert column index (0-based) to Excel column letter (A..Z..AA)
+      const colToLetter = (index) => {
+        let num = index + 1;
+        let s = "";
+        while (num > 0) {
+          const m = (num - 1) % 26;
+          s = String.fromCharCode(65 + m) + s;
+          num = Math.floor((num - 1) / 26);
+        }
+        return s;
+      };
+
+      // find the QR Image column index (0-based)
       const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage");
-      const pixelSize = 90;
+      const colLetter = colToLetter(qrImageColIndex);
+
+      let imagesAdded = 0;
       for (let i = 0; i < rows.length; i++) {
         const text = rows[i].qrRaw || rows[i].serial || "";
         if (!text) continue;
+
         const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
         const imgId = wb.addImage({ buffer: buf, extension: "png" });
-        ws.addImage(imgId, {
-          tl: { col: qrImageColIndex, row: i + 1 },
-          ext: { width: pixelSize, height: pixelSize },
-        });
+
+        const rowNumber = i + 2; // +2 because worksheet row 1 is header, rows[0] -> row 2
+        // anchor image to single cell like "N2:N2" (ExcelJS accepts range string)
+        const range = `${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
+        ws.addImage(imgId, range);
+        imagesAdded++;
       }
+      console.log("[EXPORT-XLSX-IMG] images added:", imagesAdded);
     }
 
     const outName = `Master_QR_${Date.now()}.xlsx`;
@@ -949,18 +990,20 @@ app.delete("/api/staged-alt/:id", async (req, res) => {
 });
 
 // Clear all scans — ALT
-app.post("/api/staged-alt/clear", async (_req, res) => {
+app.post("/api/staged-alt/clear", async (req, res) => {
   try {
+    console.log("[CLEAR-ALT] /api/staged-alt/clear called - ip:", req.ip, "ua:", req.headers["user-agent"]);
     if (fs.existsSync(QR_DIR_ALT)) {
       for (const f of fs.readdirSync(QR_DIR_ALT)) {
         const p = path.join(QR_DIR_ALT, f);
-        try { fs.unlinkSync(p); } catch {}
+        try { fs.unlinkSync(p); } catch (err) { console.warn("Failed to unlink ALT QR file:", p, err && err.message); }
       }
     }
     await pool.query(`DELETE FROM \`scans_alt\``);
     io.emit("cleared-scans-alt");
     res.json({ ok: true });
   } catch (e) {
+    console.error("[CLEAR-ALT] error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -974,7 +1017,7 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
     }
 
     const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
-    const sheetName = wb.SheetNames[0];
+    const sheetName = wb.SheetNames[0] || "Sheet1";
 
     const HEADERS = [
       "Serial","Stage","Operator",
@@ -998,10 +1041,13 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
     const aoa = [HEADERS, ...dataRows];
     const newWs = XLSX.utils.aoa_to_sheet(aoa);
     wb.Sheets[sheetName] = newWs;
+    if (!wb.SheetNames.includes(sheetName)) wb.SheetNames = [sheetName, ...wb.SheetNames];
 
     const outName = `Alt_${Date.now()}.xlsm`;
     const outPath = path.join(UPLOAD_DIR, outName);
-    XLSX.writeFile(wb, outPath, { bookType: "xlsm", bookVBA: true });
+    const outBuffer = XLSX.write(wb, { bookType: "xlsm", bookVBA: true, type: "buffer" });
+    fs.writeFileSync(outPath, outBuffer);
+
     res.download(outPath, outName);
   } catch (err) {
     console.error("Export ALT failed:", err);
@@ -1065,18 +1111,31 @@ app.all("/api/export-alt-xlsx-images", async (_req, res) => {
     for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
 
     if (QRCode) {
+      const colToLetter = (index) => {
+        let num = index + 1;
+        let s = "";
+        while (num > 0) {
+          const m = (num - 1) % 26;
+          s = String.fromCharCode(65 + m) + s;
+          num = Math.floor((num - 1) / 26);
+        }
+        return s;
+      };
       const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage");
-      const pixelSize = 90;
+      const colLetter = colToLetter(qrImageColIndex);
+
+      let imagesAdded = 0;
       for (let i = 0; i < rows.length; i++) {
         const text = rows[i].qrRaw || rows[i].serial || "";
         if (!text) continue;
         const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
         const imgId = wb.addImage({ buffer: buf, extension: "png" });
-        ws.addImage(imgId, {
-          tl: { col: qrImageColIndex, row: i + 1 },
-          ext: { width: pixelSize, height: pixelSize },
-        });
+        const rowNumber = i + 2;
+        const range = `${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
+        ws.addImage(imgId, range);
+        imagesAdded++;
       }
+      console.log("[EXPORT-ALT-XLSX-IMG] images added:", imagesAdded);
     }
 
     const outName = `Alt_QR_${Date.now()}.xlsx`;
