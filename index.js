@@ -564,13 +564,149 @@ app.post("/api/upload-template", upload.single("template"), (req, res) => {
   res.json({ ok: true, path: req.file?.path });
 });
 
+// ---- Helper: programmatic XLSX export fallback used when template missing ----
+async function programmaticXlsmFallback({ table = "scans", outNamePrefix = "Master" }, res) {
+  // Try to use ExcelJS to build an .xlsx with images if possible
+  const ExcelJS = await getExcelJS();
+  const QRCode = await getQRCode();
+
+  // Retrieve rows
+  const [rows] = await pool.query(`SELECT * FROM \`${table}\` ORDER BY \`id\` ASC`);
+
+  if (ExcelJS) {
+    try {
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("Scans");
+
+      const columns = [
+        { header: "Serial",      key: "serial",      width: 22 },
+        { header: "Stage",       key: "stage",       width: 12 },
+        { header: "Operator",    key: "operator",    width: 18 },
+        { header: "Wagon1ID",    key: "wagon1Id",    width: 14 },
+        { header: "Wagon2ID",    key: "wagon2Id",    width: 14 },
+        { header: "Wagon3ID",    key: "wagon3Id",    width: 14 },
+        { header: "RecievedAt",  key: "receivedAt",  width: 18 },
+        { header: "LoadedAt",    key: "loadedAt",    width: 18 },
+        { header: "Destination", key: "destination", width: 20 },
+        { header: "Grade",       key: "grade",       width: 12 },
+        { header: "RailType",    key: "railType",    width: 12 },
+        { header: "Spec",        key: "spec",        width: 18 },
+        { header: "Length",      key: "lengthM",     width: 10 },
+        { header: "QRText",      key: "qrRaw",       width: 42 },
+        { header: "QR Image",    key: "qrImage",     width: 16 },
+        { header: "Timestamp",   key: "timestamp",   width: 24 },
+      ];
+      ws.columns = columns;
+      rows.forEach((s) => {
+        ws.addRow({
+          serial:     s.serial || "",
+          stage:      s.stage || "",
+          operator:   s.operator || "",
+          wagon1Id:   s.wagon1Id || "",
+          wagon2Id:   s.wagon2Id || "",
+          wagon3Id:   s.wagon3Id || "",
+          receivedAt: s.receivedAt || "",
+          loadedAt:   s.loadedAt || "",
+          destination:s.destination || "",
+          grade:      s.grade || "",
+          railType:   s.railType || "",
+          spec:       s.spec || "",
+          lengthM:    s.lengthM || "",
+          qrRaw:      s.qrRaw || s.serial || "",
+          qrImage:    "",
+          timestamp:  s.timestamp ? new Date(s.timestamp).toISOString() : "",
+        });
+      });
+
+      ws.getRow(1).font = { bold: true };
+      for (let i = 2; i <= rows.length + 1; i++) ws.getRow(i).height = 70;
+
+      if (QRCode) {
+        const colToLetter = (index) => {
+          let num = index + 1;
+          let s = "";
+          while (num > 0) {
+            const m = (num - 1) % 26;
+            s = String.fromCharCode(65 + m) + s;
+            num = Math.floor((num - 1) / 26);
+          }
+          return s;
+        };
+        const qrImageColIndex = columns.findIndex((c) => c.key === "qrImage");
+        const colLetter = colToLetter(qrImageColIndex);
+
+        let imagesAdded = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const text = rows[i].qrRaw || rows[i].serial || "";
+          if (!text) continue;
+          const buf = await QRCode.toBuffer(text, { type: "png", margin: 1, scale: 4 });
+          const imgId = wb.addImage({ buffer: buf, extension: "png" });
+          const rowNumber = i + 2;
+          const range = `${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
+          ws.addImage(imgId, range);
+          imagesAdded++;
+        }
+        console.log(`[FALLBACK-${table}] images added:`, imagesAdded);
+      }
+
+      const outName = `${outNamePrefix}_fallback_${Date.now()}.xlsx`;
+      res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+      await wb.xlsx.write(res);
+      res.end();
+      return;
+    } catch (e) {
+      console.warn(`[FALLBACK-${table}] ExcelJS fallback failed:`, e.message || e);
+      // continue to simple XLSX aoa fallback
+    }
+  }
+
+  // Last-resort fallback: use sheet-from-AoA with XLSX (no images)
+  try {
+    const HEADERS = [
+      "Serial","Stage","Operator",
+      "Wagon1ID","Wagon2ID","Wagon3ID",
+      "RecievedAt","LoadedAt","Destination",
+      "Grade","RailType","Spec","Length",
+      "QRText","QRImagePath",
+      "Timestamp",
+    ];
+
+    const dataRows = rows.map((s) => ([
+      s.serial || "", s.stage || "", s.operator || "",
+      s.wagon1Id || "", s.wagon2Id || "", s.wagon3Id || "",
+      s.receivedAt || "", s.loadedAt || "", s.destination || "",
+      s.grade || "", s.railType || "", s.spec || "", s.lengthM || "",
+      s.qrRaw || "", s.qrPngPath || "",
+      s.timestamp ? new Date(s.timestamp).toISOString() : "",
+    ]));
+
+    const aoa = [HEADERS, ...dataRows];
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    XLSX.utils.book_append_sheet(wb, ws, "Scans");
+
+    const outName = `${outNamePrefix}_fallback_${Date.now()}.xlsx`;
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
+    res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.send(Buffer.from(buf));
+    return;
+  } catch (e) {
+    console.error(`[FALLBACK-${table}] final fallback failed:`, e);
+    res.status(500).json({ error: e.message || String(e) });
+    return;
+  }
+}
+
 // Export to .xlsm (macro-enabled) — MAIN (includes Destination)
-// Replaced with safer write-to-buffer and logging
+// If template exists, use template and write .xlsm; otherwise fall back to programmatic export
 app.post("/api/export-to-excel", async (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template.xlsm");
     if (!fs.existsSync(templatePath)) {
-      return res.status(400).json({ error: "template.xlsm not found" });
+      console.warn("[EXPORT-XLSM] template.xlsm not found — falling back to programmatic export");
+      return await programmaticXlsmFallback({ table: "scans", outNamePrefix: "Master" }, res);
     }
 
     // Read template (keep bookVBA true)
@@ -615,8 +751,7 @@ app.post("/api/export-to-excel", async (_req, res) => {
     console.log("[EXPORT-XLSM] wrote file:", outPath, "size:", fs.statSync(outPath).size);
     res.download(outPath, outName, (err) => {
       if (err) console.error("[EXPORT-XLSM] download error:", err);
-      // optionally remove file after download:
-      // try { fs.unlinkSync(outPath); } catch (e) {}
+      // don't delete file here — keep for diagnostics; rotate/delete via cron if needed
     });
   } catch (err) {
     console.error("Export failed:", err);
@@ -625,7 +760,6 @@ app.post("/api/export-to-excel", async (_req, res) => {
 });
 
 // Export to .xlsx with embedded QR images (no template) — MAIN (includes Destination)
-// Replaced with cell-range anchored images and logging
 app.all("/api/export-xlsx-images", async (_req, res) => {
   const ExcelJS = await getExcelJS();
   if (!ExcelJS) return res.status(400).json({ error: "exceljs not installed. Run: npm i exceljs qrcode" });
@@ -1013,7 +1147,8 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
   try {
     const templatePath = path.join(UPLOAD_DIR, "template_alt.xlsm");
     if (!fs.existsSync(templatePath)) {
-      return res.status(400).json({ error: "template_alt.xlsm not found" });
+      console.warn("[EXPORT-ALT-XLSM] template_alt.xlsm not found — falling back to programmatic export");
+      return await programmaticXlsmFallback({ table: "scans_alt", outNamePrefix: "Alt" }, res);
     }
 
     const wb = XLSX.readFile(templatePath, { cellDates: true, bookVBA: true });
@@ -1048,6 +1183,7 @@ app.post("/api/export-alt-to-excel", async (_req, res) => {
     const outBuffer = XLSX.write(wb, { bookType: "xlsm", bookVBA: true, type: "buffer" });
     fs.writeFileSync(outPath, outBuffer);
 
+    console.log("[EXPORT-ALT-XLSM] wrote file:", outPath, "size:", fs.statSync(outPath).size);
     res.download(outPath, outName);
   } catch (err) {
     console.error("Export ALT failed:", err);
