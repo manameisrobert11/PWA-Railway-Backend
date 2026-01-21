@@ -38,21 +38,28 @@ const __dirname = process.cwd();
 const app = express();
 
 // ---- Allowed origins (Netlify + local dev) ----
-// UPDATE THIS with your actual Netlify URL!
 const ALLOWED_ORIGINS = [
   "https://pwarailway.netlify.app",
-  "https://railinventoryscanner.netlify.app",  // Add your actual Netlify URL if different
-  process.env.FRONTEND_URL,  // Allow setting via environment variable
+  process.env.FRONTEND_URL,
   process.env.LOCAL_ORIGIN || "http://localhost:5173",
-].filter(Boolean);  // Remove undefined/null values
+].filter(Boolean);
+
+// Function to check if origin is allowed (supports Netlify deploy previews)
+function isOriginAllowed(origin) {
+  if (!origin) return true; // Allow non-browser requests
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Allow Netlify deploy preview URLs (e.g., https://abc123--pwarailway.netlify.app)
+  if (/^https:\/\/[a-z0-9]+--pwarailway\.netlify\.app$/.test(origin)) return true;
+  return false;
+}
 
 console.log("[CORS] Allowed origins:", ALLOWED_ORIGINS);
+console.log("[CORS] Also allowing: *--pwarailway.netlify.app (deploy previews)");
 
 // ---- CORS for REST ----
 app.use(cors({
   origin: (origin, cb) => {
-    // allow non-browser tools (no origin) and whitelisted origins
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (isOriginAllowed(origin)) return cb(null, true);
     console.warn(`[CORS] Blocked origin: ${origin}`);
     return cb(new Error(`CORS blocked for origin: ${origin}`));
   },
@@ -207,7 +214,7 @@ const io = new Server(server, {
   transports: ["websocket", "polling"],
   cors: {
     origin: (origin, cb) => {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      if (isOriginAllowed(origin)) return cb(null, true);
       console.warn(`[Socket CORS] Blocked origin: ${origin}`);
       return cb(new Error(`Socket CORS blocked for origin: ${origin}`));
     },
