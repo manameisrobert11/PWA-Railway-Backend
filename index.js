@@ -67,7 +67,15 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: "256kb" }));
+
+ // Allow larger JSON uploads for offline scan recovery
+app.use(express.json({ limit: "20mb" }));
+
+app.use(express.urlencoded({
+  extended: true,
+  limit: "20mb"
+}));
+
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
